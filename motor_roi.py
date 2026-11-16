@@ -48,7 +48,7 @@ from datetime import datetime
 from pathlib import Path
 
 TITULO = "Motor de Otimização e Retenção com ROI"
-VERSAO = "1.2.0"          # ao mudar, o GitHub Actions gera e publica o instalador novo
+VERSAO = "1.2.3"          # ao mudar, o GitHub Actions gera e publica o instalador novo
 EXTENSOES = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".wmv", ".flv", ".webm",
              ".mpg", ".mpeg", ".ts", ".mts", ".m2ts", ".3gp", ".dav", ".h264", ".h265"}
 SUFIXO = " - ROI"
@@ -358,6 +358,7 @@ class Ajustes:
     mostrar_roi: bool = False        # desenha as regiões no vídeo (diagnóstico)
     calcular_hash: bool = True
     vmaf: bool = True                # mede a qualidade, se o ffmpeg tiver o filtro libvmaf
+    apagar_original: bool = False    # apaga o original só depois de tudo gravado e conferido
 
     def validar(self) -> None:
         if self.modo not in MODOS:
@@ -1103,6 +1104,28 @@ def _sha256(arquivo: Path) -> str:
     return h.hexdigest()
 
 
+def apagar_original(origem: Path, res: Resultado, aj: Ajustes, manifesto: dict, caminho_manifesto: Path) -> None:
+    """Apaga o original (sem Lixeira). Só é chamada com o reduzido gravado no destino, aprovado na
+    conferência de duração, menor que o original e com o manifesto já gravado.
+    Com as regiões desenhadas o reduzido é só um teste, e o original é mantido."""
+    notas = [res.detalhe] if res.detalhe else []
+    if aj.mostrar_roi:
+        notas.append("original mantido: regiões desenhadas no vídeo (teste)")
+    else:
+        try:
+            origem.unlink()
+            notas.append("original apagado")
+            manifesto["origem"]["apagado"] = True
+            try:
+                with open(caminho_manifesto, "w", encoding="utf-8") as f:
+                    json.dump(manifesto, f, ensure_ascii=False, indent=1)
+            except OSError:
+                pass
+        except OSError as e:
+            notas.append(f"não foi possível apagar o original ({e.strerror or e})")
+    res.detalhe = "; ".join(notas)
+
+
 def processar(origem: Path, destino: Path, aj: Ajustes, detector, ao_progredir=None,
               ao_etapa=None, cancelar: threading.Event | None = None,
               cpus: list[int] | None = None) -> Resultado:
@@ -1193,8 +1216,12 @@ def processar(origem: Path, destino: Path, aj: Ajustes, detector, ao_progredir=N
         if aj.calcular_hash:
             manifesto["origem"]["sha256"] = _sha256(origem)
             manifesto["saida"]["sha256"] = _sha256(destino)
-        with open(destino.with_suffix(".json"), "w", encoding="utf-8") as f:
+        manifesto["origem"]["apagado"] = False
+        caminho_manifesto = destino.with_suffix(".json")
+        with open(caminho_manifesto, "w", encoding="utf-8") as f:
             json.dump(manifesto, f, ensure_ascii=False, indent=1)
+        if aj.apagar_original and res.status == "Convertido":
+            apagar_original(origem, res, aj, manifesto, caminho_manifesto)
         ao_progredir(1.0)
     except Cancelado:
         res.status, res.detalhe = "Cancelado", ""
@@ -1857,6 +1884,128 @@ DETECTORES_TELA = (("Automático", "auto"), ("YOLO + OpenVINO", "openvino"),
                    ("YOLO (PyTorch)", "yolo"), ("Só movimento", "movimento"))
 
 
+class Dica:
+    """Explicação que aparece ao parar o mouse sobre um campo da janela."""
+
+    ATRASO_MS = 450
+
+    def __init__(self, widgets, texto: str, largura: int = 430):
+        import tkinter as tk
+        self.tk, self.texto, self.largura = tk, texto, largura
+        self.janela = None
+        self.agendado = None
+        for w in widgets if isinstance(widgets, (list, tuple)) else [widgets]:
+            w.bind("<Enter>", self._agendar, add="+")
+            w.bind("<Leave>", self._esconder, add="+")
+            w.bind("<ButtonPress>", self._esconder, add="+")
+            w.bind("<MouseWheel>", self._esconder, add="+")
+
+    def _agendar(self, ev):
+        self._esconder()
+        w = ev.widget
+        self.agendado = (w, w.after(self.ATRASO_MS, lambda: self._mostrar(w)))
+
+    def _mostrar(self, w):
+        self.agendado = None
+        if self.janela is not None:
+            return
+        tk = self.tk
+        self.janela = tk.Toplevel(w)
+        self.janela.wm_overrideredirect(True)
+        try:
+            self.janela.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        moldura = tk.Frame(self.janela, background=AZUL, padx=1, pady=1)
+        moldura.pack()
+        tk.Label(moldura, text=self.texto, justify="left", wraplength=self.largura, background=BRANCO,
+                 foreground=TEXTO, padx=10, pady=7, font=("Segoe UI", 9)).pack()
+        self.janela.update_idletasks()
+        x = w.winfo_rootx()
+        y = w.winfo_rooty() + w.winfo_height() + 4
+        larg, alt = self.janela.winfo_reqwidth(), self.janela.winfo_reqheight()
+        x = max(0, min(x, w.winfo_screenwidth() - larg - 8))
+        if y + alt > w.winfo_screenheight() - 40:          # sem espaço embaixo: mostra em cima
+            y = w.winfo_rooty() - alt - 4
+        self.janela.wm_geometry(f"+{x}+{y}")
+
+    def _esconder(self, _=None):
+        if self.agendado is not None:
+            w, ident = self.agendado
+            self.agendado = None
+            try:
+                w.after_cancel(ident)
+            except Exception:
+                pass
+        if self.janela is not None:
+            self.janela.destroy()
+            self.janela = None
+
+
+NOTA_APAGAR = "somente depois de convertido com sucesso; não vai para a Lixeira"
+NOTA_APAGAR_BLOQUEADO = "escolha os vídeos na lista para habilitar"
+
+DICAS = {
+    "modo": "Como o vídeo reduzido é montado:\n"
+            "•  Retenção: grava tudo, com a mesma duração e o áudio do original. Nos trechos sem "
+            "atividade, guarda poucos quadros por segundo. Indicado para guardar como evidência.\n"
+            "•  Time-lapse: grava tudo, mas acelera os trechos sem atividade. O vídeo fica mais curto "
+            "e sem áudio.\n"
+            "•  Eventos: grava só os trechos com atividade. O vídeo fica bem mais curto e sem áudio.",
+    "codec": "Codificador do vídeo reduzido:\n"
+             "•  H.265 (libx265): padrão. Arquivos menores; usa o processador.\n"
+             "•  H.264 (libx264): arquivos maiores, mas abre em qualquer aparelho ou player.\n"
+             "•  Intel Quick Sync: usa a placa de vídeo Intel e é mais rápido. Ainda não foi validado "
+             "em hardware.\n"
+             "•  AV1: só reduz os quadros por segundo; o codificador SVT-AV1 ignora as regiões de "
+             "interesse, então pessoas e fundo recebem a mesma qualidade.",
+    "detector": "Como pessoas e veículos são encontrados nas imagens:\n"
+                "•  Automático: usa o YOLO com OpenVINO, se estiver instalado; senão, o YOLO em PyTorch; "
+                "sem o YOLO, só a detecção de movimento.\n"
+                "•  YOLO + OpenVINO: mais rápido em processadores e placas de vídeo Intel.\n"
+                "•  YOLO (PyTorch): reconhece pessoas e veículos em qualquer computador.\n"
+                "•  Só movimento: não reconhece pessoas nem veículos. Tudo o que se mexe vira região de "
+                "interesse, e uma pessoa parada não é percebida.",
+    "qp": "Qualidade de cada tipo de região, de 10 a 51: quanto MENOR o número, mais nítida a imagem e "
+          "maior o arquivo.\n"
+          "O Fundo é a base do quadro inteiro; pessoas, veículos e movimento recebem mais qualidade que "
+          "ele. Um valor maior que o do Fundo não tem efeito.",
+    "pessoa": "Qualidade das áreas com pessoas (padrão 22).\n"
+              "É a região mais importante para reconhecer alguém. Diminua para rostos e roupas mais "
+              "nítidos; aumente para economizar espaço.",
+    "veiculo": "Qualidade das áreas com veículos em movimento (padrão 26).\n"
+               "Veículo estacionado é tratado como cenário e fica com a qualidade do Fundo. Para ler "
+               "placas, diminua este valor.",
+    "movimento": "Qualidade das outras áreas com movimento que não são pessoa nem veículo (padrão 30): "
+                 "animais, portões, objetos.\n"
+                 "Sem o YOLO (detector Só movimento), todo movimento usa este valor.",
+    "fundo": "Qualidade do restante da imagem (padrão 36): paredes, chão, céu, cenário parado.\n"
+             "É o que mais pesa no tamanho do arquivo: aumentar este número reduz bastante o vídeo; "
+             "diminuir deixa o cenário mais nítido.",
+    "fps": "Quantos quadros por segundo o vídeo reduzido guarda em cada situação. Menos quadros, "
+           "arquivo menor.",
+    "fps_ativo": "Quadros por segundo nos trechos com atividade (movimento ou pessoas). Padrão 15.\n"
+                 "0 mantém a taxa original da câmera. Para movimentos rápidos ou leitura de placas, use "
+                 "valores maiores.",
+    "fps_ocioso": "Quadros por segundo nos trechos sem atividade. Padrão 1 (uma imagem por segundo).\n"
+                  "No Time-lapse, define a aceleração: com 15 quadros/s na atividade e 1 sem atividade, os "
+                  "trechos parados passam 15 vezes mais rápido.\n"
+                  "No modo Eventos não se aplica: os trechos sem atividade são descartados.",
+    "vmaf": "Compara o vídeo reduzido com o original e dá notas de 0 a 100 (quanto mais perto de 100, "
+            "mais parecido com o original): uma para o quadro inteiro e outra só dentro das regiões de "
+            "interesse.\n"
+            "As notas aparecem na tabela, no registro e no arquivo .json. O processamento fica mais demorado.",
+    "apagar": "Apaga cada vídeo original depois que o reduzido e o manifesto .json foram gravados, "
+              "conferidos e o reduzido ficou menor que ele. Vídeos com erro, cancelados ou sem ganho mantêm "
+              "o original; com \"Desenhar as regiões\", nada é apagado.\n"
+              "O arquivo é apagado direto, sem passar pela Lixeira.\n"
+              "Fica disponível depois de escolher os vídeos na lista e volta a ficar desmarcado a cada lote.",
+    "regioes": "Desenha retângulos em volta das regiões detectadas (pessoas, veículos, movimento) no vídeo "
+               "reduzido, para conferir se a detecção está acertando.\n"
+               "Use só para teste: os retângulos ficam gravados no vídeo, e a medição VMAF não é feita.",
+}
+
+
 def resumo(resultados: list[Resultado]) -> str:
     feitos = [r for r in resultados if r.status == "Convertido"]
     erros = sum(r.status == "Erro" for r in resultados)
@@ -1888,7 +2037,7 @@ def rodar_gui() -> int:
 
     janela = tk.Tk()
     janela.title(f"C&C - {TITULO} {VERSAO}")
-    janela.geometry("1180x850")
+    janela.geometry("1180x880")
     janela.minsize(1000, 700)
     janela.configure(bg=FUNDO)
 
@@ -1967,6 +2116,7 @@ def rodar_gui() -> int:
     tem_vmaf = ferramenta_vmaf() is not None
     # Uma opção ou outra, nunca as duas: desenhar as regiões no vídeo impede medir o VMAF.
     v_verificacao = tk.StringVar(value="vmaf")
+    v_apagar = tk.BooleanVar(value=False)
     hw = hardware()
     v_jobs = tk.IntVar(value=hw.sugerido)
     v_jobs_dica = tk.StringVar()
@@ -2023,40 +2173,70 @@ def rodar_gui() -> int:
 
     linha1 = ttk.Frame(topo)
     linha1.grid(row=5, column=0, columnspan=3, sticky="w", pady=(12, 0))
-    ttk.Label(linha1, text="Modo:", style="Rotulo.TLabel").pack(side="left")
-    caixa(linha1, v_modo, MODOS_TELA, 38).pack(side="left", padx=(6, 18))
-    ttk.Label(linha1, text="Codec:", style="Rotulo.TLabel").pack(side="left")
-    caixa(linha1, v_codec, codecs, 22).pack(side="left", padx=(6, 18))
-    ttk.Label(linha1, text="Detector:", style="Rotulo.TLabel").pack(side="left")
-    caixa(linha1, v_detector, DETECTORES_TELA, 17).pack(side="left", padx=(6, 0))
+    rotulo = ttk.Label(linha1, text="Modo:", style="Rotulo.TLabel")
+    rotulo.pack(side="left")
+    campo = caixa(linha1, v_modo, MODOS_TELA, 38)
+    campo.pack(side="left", padx=(6, 18))
+    Dica([rotulo, campo], DICAS["modo"])
+    rotulo = ttk.Label(linha1, text="Codec:", style="Rotulo.TLabel")
+    rotulo.pack(side="left")
+    campo = caixa(linha1, v_codec, codecs, 22)
+    campo.pack(side="left", padx=(6, 18))
+    Dica([rotulo, campo], DICAS["codec"])
+    rotulo = ttk.Label(linha1, text="Detector:", style="Rotulo.TLabel")
+    rotulo.pack(side="left")
+    campo = caixa(linha1, v_detector, DETECTORES_TELA, 17)
+    campo.pack(side="left", padx=(6, 0))
+    Dica([rotulo, campo], DICAS["detector"])
 
     linha2 = ttk.Frame(topo)
     linha2.grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
-    ttk.Label(linha2, text="Qualidade (QP):", style="Rotulo.TLabel").pack(side="left")
-    for nome, rotulo in (("pessoa", "Pessoa"), ("veiculo", "Veículo"), ("movimento", "Movimento"),
-                         ("fundo", "Fundo")):
-        ttk.Label(linha2, text=rotulo).pack(side="left", padx=(10, 0))
-        ttk.Spinbox(linha2, from_=10, to=51, width=4, textvariable=v_qp[nome]).pack(side="left", padx=(4, 0))
-    ttk.Label(linha2, text="menor = mais qualidade", style="Dica.TLabel").pack(side="left", padx=(10, 0))
+    rotulo = ttk.Label(linha2, text="Qualidade (QP):", style="Rotulo.TLabel")
+    rotulo.pack(side="left")
+    Dica(rotulo, DICAS["qp"])
+    for nome, texto in (("pessoa", "Pessoa"), ("veiculo", "Veículo"), ("movimento", "Movimento"),
+                        ("fundo", "Fundo")):
+        rotulo = ttk.Label(linha2, text=texto)
+        rotulo.pack(side="left", padx=(10, 0))
+        campo = ttk.Spinbox(linha2, from_=10, to=51, width=4, textvariable=v_qp[nome])
+        campo.pack(side="left", padx=(4, 0))
+        Dica([rotulo, campo], DICAS[nome])
+    rotulo = ttk.Label(linha2, text="menor = mais qualidade", style="Dica.TLabel")
+    rotulo.pack(side="left", padx=(10, 0))
+    Dica(rotulo, DICAS["qp"])
 
     linha3 = ttk.Frame(topo)
     linha3.grid(row=7, column=0, columnspan=3, sticky="w", pady=(8, 0))
-    ttk.Label(linha3, text="Quadros por segundo:", style="Rotulo.TLabel").pack(side="left")
-    ttk.Label(linha3, text="Com atividade").pack(side="left", padx=(10, 0))
-    ttk.Spinbox(linha3, from_=0, to=60, width=4, textvariable=v_fps_ativo).pack(side="left", padx=(4, 0))
-    ttk.Label(linha3, text="0 = taxa original", style="Dica.TLabel").pack(side="left", padx=(6, 0))
-    ttk.Label(linha3, text="Sem atividade").pack(side="left", padx=(14, 0))
-    ttk.Spinbox(linha3, from_=0.2, to=10, increment=0.5, width=4,
-                textvariable=v_fps_ocioso).pack(side="left", padx=(4, 0))
+    rotulo = ttk.Label(linha3, text="Quadros por segundo:", style="Rotulo.TLabel")
+    rotulo.pack(side="left")
+    Dica(rotulo, DICAS["fps"])
+    rotulo = ttk.Label(linha3, text="Com atividade")
+    rotulo.pack(side="left", padx=(10, 0))
+    campo = ttk.Spinbox(linha3, from_=0, to=60, width=4, textvariable=v_fps_ativo)
+    campo.pack(side="left", padx=(4, 0))
+    nota = ttk.Label(linha3, text="0 = taxa original", style="Dica.TLabel")
+    nota.pack(side="left", padx=(6, 0))
+    Dica([rotulo, campo, nota], DICAS["fps_ativo"])
+    rotulo = ttk.Label(linha3, text="Sem atividade")
+    rotulo.pack(side="left", padx=(14, 0))
+    campo = ttk.Spinbox(linha3, from_=0.2, to=10, increment=0.5, width=4, textvariable=v_fps_ocioso)
+    campo.pack(side="left", padx=(4, 0))
+    Dica([rotulo, campo], DICAS["fps_ocioso"])
 
     linha4 = ttk.Frame(topo)
     linha4.grid(row=8, column=0, columnspan=3, sticky="w", pady=(8, 0))
-    ttk.Radiobutton(linha4, text="Medir qualidade (VMAF)" if tem_vmaf else "VMAF indisponível neste ffmpeg",
-                    variable=v_verificacao, value="vmaf").pack(side="left")
-    ttk.Label(linha4, text="quadro inteiro e dentro das regiões; 0 a 100", style="Dica.TLabel").pack(
-        side="left", padx=(6, 0))
-    ttk.Radiobutton(linha4, text="Desenhar as regiões no vídeo (confere a detecção; sem VMAF)",
-                    variable=v_verificacao, value="regioes").pack(side="left", padx=(22, 0))
+    campo = ttk.Radiobutton(linha4, text="Medir qualidade (VMAF)" if tem_vmaf else "VMAF indisponível neste ffmpeg",
+                            variable=v_verificacao, value="vmaf")
+    campo.pack(side="left")
+    nota = ttk.Label(linha4, text="quadro inteiro e dentro das regiões; 0 a 100", style="Dica.TLabel")
+    nota.pack(side="left", padx=(6, 0))
+    Dica([campo, nota], DICAS["vmaf"] if tem_vmaf else
+         DICAS["vmaf"] + "\n\nO ffmpeg deste computador não tem o filtro libvmaf (nem há um ffvmaf ao lado "
+         "do programa), então a medição não está disponível.")
+    campo = ttk.Radiobutton(linha4, text="Desenhar as regiões no vídeo (confere a detecção; sem VMAF)",
+                            variable=v_verificacao, value="regioes")
+    campo.pack(side="left", padx=(22, 0))
+    Dica(campo, DICAS["regioes"])
 
     linha5 = ttk.Frame(topo)
     linha5.grid(row=9, column=0, columnspan=3, sticky="w", pady=(8, 0))
@@ -2066,6 +2246,38 @@ def rodar_gui() -> int:
     ttk.Label(linha5, textvariable=v_jobs_dica, style="Dica.TLabel").pack(side="left")
     ttk.Label(topo, text=hw.descricao(), style="Dica.TLabel").grid(row=10, column=0, columnspan=3,
                                                                    sticky="w", pady=(2, 0))
+
+    def confirmar_apagar():
+        """Ao marcar, pede confirmação (foco em "Não"); sem confirmação, volta a desmarcar."""
+        if v_apagar.get() and not messagebox.askyesno(
+                "Apagar arquivos originais", "Deseja realmente apagar os vídeos originais?",
+                icon="warning", default="no", parent=janela):
+            v_apagar.set(False)
+
+    linha_apagar = ttk.Frame(topo)
+    linha_apagar.grid(row=11, column=0, columnspan=3, sticky="w", pady=(8, 0))
+    c_apagar = ttk.Checkbutton(linha_apagar, text="Apagar arquivos originais", variable=v_apagar,
+                               command=confirmar_apagar, state="disabled")
+    c_apagar.pack(side="left")
+    v_nota_apagar = tk.StringVar(value=NOTA_APAGAR_BLOQUEADO)
+    l_apagar = ttk.Label(linha_apagar, textvariable=v_nota_apagar, style="Dica.TLabel")
+    l_apagar.pack(side="left", padx=(6, 0))
+    Dica([c_apagar, l_apagar], DICAS["apagar"])
+
+    def atualizar_apagar():
+        """A opção só fica disponível com vídeos escolhidos na lista da pasta atual. Sem escolha,
+        volta a ficar desmarcada: cada lote pede a confirmação de novo."""
+        if estado["rodando"]:
+            c_apagar.configure(state="disabled")
+            return
+        esc = estado.get("escolha")
+        pode = bool(esc and esc.get("chave") == chave_da_pasta() and any(it[2] for it in esc["itens"]))
+        if not pode and v_apagar.get():
+            v_apagar.set(False)
+        c_apagar.configure(state="normal" if pode else "disabled")
+        nota = NOTA_APAGAR if pode else NOTA_APAGAR_BLOQUEADO
+        if v_nota_apagar.get() != nota:
+            v_nota_apagar.set(nota)
 
     def ler_jobs() -> int | None:
         try:
@@ -2203,7 +2415,8 @@ def rodar_gui() -> int:
                          fps_ativo=float(v_fps_ativo.get().replace(",", ".")),
                          fps_ocioso=float(v_fps_ocioso.get().replace(",", ".")),
                          mostrar_roi=v_verificacao.get() == "regioes",
-                         vmaf=v_verificacao.get() == "vmaf" and tem_vmaf)
+                         vmaf=v_verificacao.get() == "vmaf" and tem_vmaf,
+                         apagar_original=bool(v_apagar.get()))
         except (tk.TclError, ValueError):
             messagebox.showwarning("Ajustes", "Qualidade e quadros por segundo precisam ser números.",
                                    parent=janela)
@@ -2222,6 +2435,21 @@ def rodar_gui() -> int:
         if jobs > hw.maximo:
             v_jobs.set(hw.maximo)
             jobs = hw.maximo
+        if aj.apagar_original and aj.mostrar_roi:
+            messagebox.showinfo("Apagar arquivos originais",
+                                "Com \"Desenhar as regiões no vídeo\" o resultado é só um teste: "
+                                "os originais NÃO serão apagados.", parent=janela)
+        elif aj.apagar_original and aj.modo != "retencao":
+            nome = "Time-lapse" if aj.modo == "timelapse" else "Eventos"
+            if not messagebox.askyesno(
+                    "Apagar arquivos originais",
+                    f"No modo {nome}, o vídeo reduzido não guarda tudo o que o original tem "
+                    + ("(os trechos sem atividade são acelerados e o áudio é removido)."
+                       if aj.modo == "timelapse" else
+                       "(só os trechos com atividade são gravados, sem áudio).")
+                    + "\n\nApagar mesmo assim os originais depois de convertidos?",
+                    icon="warning", default="no", parent=janela):
+                return None
         return saida, aj, jobs
 
     def disparar(pares, raiz, raiz_log, aj, jobs):
@@ -2441,6 +2669,7 @@ def rodar_gui() -> int:
         except queue.Empty:
             pass
         atualizar_eta()
+        atualizar_apagar()
         janela.after(200, processar_eventos)
 
     def fechar():
@@ -2500,6 +2729,9 @@ def ler_argumentos(argv=None) -> tuple[argparse.Namespace, Ajustes]:
     p.add_argument("--paralelo", type=int, default=0, help="trechos de um vídeo codificados ao mesmo tempo")
     p.add_argument("--mostrar-roi", action="store_true", help="desenha as regiões no vídeo (diagnóstico)")
     p.add_argument("--sem-hash", action="store_true", help="não calcula o SHA-256 dos arquivos")
+    p.add_argument("--apagar-originais", action="store_true",
+                   help="apaga cada original depois de convertido com sucesso (sem confirmação, não vai "
+                        "para a Lixeira; nunca com --mostrar-roi)")
     p.add_argument("--sem-vmaf", action="store_true", help="não mede o índice VMAF (mais rápido)")
     p.add_argument("--versao", action="version", version=f"{TITULO} {VERSAO}")
     p.add_argument("--registros", nargs="?", const="", metavar="PASTA_OU_CSV",
@@ -2512,7 +2744,7 @@ def ler_argumentos(argv=None) -> tuple[argparse.Namespace, Ajustes]:
                  janela=a.janela, antes=a.antes, depois=a.depois, sensibilidade=a.sensibilidade,
                  detector=a.detector, modelo=a.modelo, confianca=a.confianca, dispositivo=a.dispositivo,
                  audio=not a.sem_audio, paralelo=a.paralelo, mostrar_roi=a.mostrar_roi,
-                 calcular_hash=not a.sem_hash, vmaf=not a.sem_vmaf)
+                 calcular_hash=not a.sem_hash, vmaf=not a.sem_vmaf, apagar_original=a.apagar_originais)
     return a, aj
 
 
@@ -2596,6 +2828,8 @@ def main(argv=None) -> int:
                           f"em {tempo(r.segundos)}")
                 if r.vmaf is not None:
                     linha += f", VMAF {r.vmaf:.1f}" + (f" (regiões {r.vmaf_roi:.1f})" if r.vmaf_roi is not None else "")
+                if r.detalhe:
+                    linha += f"; {r.detalhe}"
             elif r.detalhe:
                 linha += f" - {r.detalhe}"
             print("\r" + linha.ljust(largura))

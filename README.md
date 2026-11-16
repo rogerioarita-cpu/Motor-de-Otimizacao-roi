@@ -69,7 +69,7 @@ Para cada vídeo são gravados, ao lado do original:
 - `nome - ROI.json`: o manifesto, com os ajustes usados, os eventos (início, fim, pessoas, veículos), os trechos com suas regiões e a posição de cada trecho na saída, além do SHA-256 do original e do reduzido;
 - `motor_roi_log.csv`: uma linha por vídeo processado, com as notas VMAF.
 
-O original nunca é alterado nem apagado.
+O original não é alterado. Ele só é apagado se a opção **Apagar arquivos originais** estiver marcada (ou com `--apagar-originais` no terminal), e somente depois que o reduzido foi gravado, passou na conferência de duração, ficou menor que o original e teve o manifesto `.json` gravado. O arquivo é apagado sem passar pela Lixeira; o manifesto registra `"apagado": true` na parte da origem. Vídeos com erro, cancelados, ignorados ou sem ganho mantêm o original, e com `--mostrar-roi` (regiões desenhadas) nada é apagado.
 
 ## Vídeos simultâneos
 
