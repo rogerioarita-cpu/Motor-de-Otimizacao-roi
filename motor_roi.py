@@ -42,13 +42,13 @@ import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 TITULO = "Motor de Otimização e Retenção com ROI"
-VERSAO = "1.1.0"          # ao mudar, o GitHub Actions gera e publica o instalador novo
+VERSAO = "1.2.0"          # ao mudar, o GitHub Actions gera e publica o instalador novo
 EXTENSOES = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".wmv", ".flv", ".webm",
              ".mpg", ".mpeg", ".ts", ".mts", ".m2ts", ".3gp", ".dav", ".h264", ".h265"}
 SUFIXO = " - ROI"
@@ -85,6 +85,205 @@ def _achar(nome: str) -> str | None:
 
 FFMPEG = _achar("ffmpeg") or "ffmpeg"
 FFPROBE = _achar("ffprobe") or "ffprobe"
+
+
+# --------------------------------------------------------------------------
+# Hardware: processador, núcleos, memória e conversões simultâneas
+# --------------------------------------------------------------------------
+GB_POR_CONVERSAO = 3          # memória por vídeo: detector YOLO + trechos x265 em paralelo
+NUCLEOS_POR_CONVERSAO_IDEAL = 4      # por vídeo processado ao mesmo tempo
+NUCLEOS_POR_CONVERSAO_MIN = 2
+SONDAGENS_SIMULTANEAS = 8     # ffprobe é quase todo espera de disco
+
+
+@dataclass
+class Hardware:
+    cpu: str
+    nucleos: list[list[int]]   # um item por núcleo físico: os processadores lógicos dele
+    logicos: int
+    ram_gb: float
+
+    @property
+    def fisicos(self) -> int:
+        return len(self.nucleos)
+
+    @property
+    def maximo(self) -> int:
+        """Teto de conversões simultâneas: >= 2 núcleos físicos e ~2 GB de RAM para cada uma."""
+        por_cpu = self.fisicos // NUCLEOS_POR_CONVERSAO_MIN
+        por_ram = int(self.ram_gb // GB_POR_CONVERSAO)
+        return max(1, min(por_cpu, por_ram))
+
+    @property
+    def sugerido(self) -> int:
+        """Valor inicial: cerca de 4 núcleos físicos por conversão."""
+        return max(1, min(self.maximo, round(self.fisicos / NUCLEOS_POR_CONVERSAO_IDEAL)))
+
+    def limitar(self, jobs: int) -> int:
+        return max(1, min(self.maximo, int(jobs)))
+
+    def grupos(self, jobs: int) -> list[list[int]]:
+        """Divide os núcleos físicos entre as conversões (núcleo i -> conversão i % jobs).
+
+        A distribuição alternada mistura núcleos de desempenho e de eficiência nos processadores
+        híbridos (Intel 12ª geração em diante), que o Windows numera em sequência."""
+        jobs = self.limitar(jobs)
+        grupos: list[list[int]] = [[] for _ in range(jobs)]
+        for i, logicos in enumerate(self.nucleos):
+            grupos[i % jobs].extend(logicos)
+        return [sorted(g) for g in grupos]
+
+    def fisicos_em(self, cpus: list[int]) -> int:
+        """Quantos núcleos físicos há num grupo de processadores lógicos."""
+        conjunto = set(cpus)
+        return max(1, sum(1 for n in self.nucleos if conjunto.issuperset(n)))
+
+    def threads_por_conversao(self, jobs: int) -> int:
+        return max(1, self.fisicos // self.limitar(jobs))
+
+    def descricao(self) -> str:
+        return (f"{self.cpu}  ·  {self.fisicos} núcleos físicos / {self.logicos} lógicos  ·  "
+                f"{self.ram_gb:.0f} GB de RAM")
+
+
+def _nucleos_windows() -> list[list[int]]:
+    import ctypes
+
+    class SLPI(ctypes.Structure):
+        _fields_ = [("mascara", ctypes.c_size_t), ("relacao", ctypes.c_int),
+                    ("_uniao", ctypes.c_ulonglong * 2)]
+
+    k32 = ctypes.windll.kernel32
+    tam = ctypes.c_ulong(0)
+    k32.GetLogicalProcessorInformation(None, ctypes.byref(tam))
+    if not tam.value:
+        return []
+    buf = (SLPI * (tam.value // ctypes.sizeof(SLPI)))()
+    if not k32.GetLogicalProcessorInformation(buf, ctypes.byref(tam)):
+        return []
+    nucleos = []
+    for e in buf:
+        if e.relacao == 0:                         # RelationProcessorCore
+            nucleos.append([b for b in range(64) if (e.mascara >> b) & 1])
+    return [n for n in nucleos if n]
+
+
+def _nucleos_linux() -> list[list[int]]:
+    vistos: dict[str, list[int]] = {}
+    base = Path("/sys/devices/system/cpu")
+    disponiveis = os.sched_getaffinity(0) if hasattr(os, "sched_getaffinity") else None
+    for cpu in sorted(base.glob("cpu[0-9]*"), key=lambda p: int(p.name[3:])):
+        n = int(cpu.name[3:])
+        if disponiveis is not None and n not in disponiveis:
+            continue
+        try:
+            irmaos = (cpu / "topology" / "thread_siblings_list").read_text().strip()
+        except OSError:
+            irmaos = str(n)
+        vistos.setdefault(irmaos, []).append(n)
+    return list(vistos.values())
+
+
+def _nome_cpu() -> str:
+    if os.name == "nt":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+                return " ".join(str(winreg.QueryValueEx(k, "ProcessorNameString")[0]).split())
+        except Exception:
+            pass
+    else:
+        try:
+            for linha in Path("/proc/cpuinfo").read_text(errors="replace").splitlines():
+                if linha.lower().startswith("model name"):
+                    return " ".join(linha.split(":", 1)[1].split())
+        except OSError:
+            pass
+    return "Processador"
+
+
+def _ram_gb() -> float:
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class MEM(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("total", ctypes.c_ulonglong), ("livre", ctypes.c_ulonglong),
+                            ("_pf", ctypes.c_ulonglong), ("_pfl", ctypes.c_ulonglong),
+                            ("_v", ctypes.c_ulonglong), ("_vl", ctypes.c_ulonglong),
+                            ("_ve", ctypes.c_ulonglong)]
+
+            m = MEM()
+            m.dwLength = ctypes.sizeof(MEM)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+                return m.total / 1024 ** 3
+        else:
+            return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1024 ** 3
+    except Exception:
+        pass
+    return 8.0
+
+
+_HARDWARE: list[Hardware] = []
+
+
+def hardware() -> Hardware:
+    """Detecta (uma vez) processador, núcleos físicos e memória deste computador."""
+    if not _HARDWARE:
+        logicos = os.cpu_count() or 2
+        try:
+            nucleos = _nucleos_windows() if os.name == "nt" else _nucleos_linux()
+        except Exception:
+            nucleos = []
+        if not nucleos:      # API indisponível: supõe 2 lógicos por núcleo (Hyper-Threading)
+            nucleos = [list(range(i, min(i + 2, logicos))) for i in range(0, logicos, 2)]
+        _HARDWARE.append(Hardware(_nome_cpu(), nucleos, logicos, _ram_gb()))
+    return _HARDWARE[0]
+
+
+_SVT: dict = {}
+
+
+def versao_svt() -> int:
+    """Versão principal da biblioteca SVT-AV1 do ffmpeg (0 se não for possível descobrir).
+
+    Até a 1.x, o parâmetro lp= é o número de processadores lógicos; nas versões novas ele virou
+    um "nível" de 0 a 6. Por isso o número de threads só é passado ao SVT-AV1 1.x; nas demais o
+    limite vem da afinidade do processo (os núcleos que o Windows deixa o ffmpeg usar)."""
+    if "major" not in _SVT:
+        major = 0
+        try:
+            r = subprocess.run([FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "info", "-f", "lavfi",
+                                "-i", "color=s=64x64:d=0.1", "-frames:v", "1", "-c:v", "libsvtav1",
+                                "-f", "null", "-"], capture_output=True, text=True, errors="replace",
+                               timeout=60, creationflags=SEM_JANELA)
+            achado = re.search(r"SVT-AV1 Encoder Lib v?(\d+)\.", r.stderr)
+            major = int(achado.group(1)) if achado else 0
+        except (OSError, subprocess.SubprocessError):
+            pass
+        _SVT["major"] = major
+    return _SVT["major"]
+
+
+def _fixar_nucleos(proc: subprocess.Popen, cpus: list[int] | None) -> None:
+    """Restringe o processo do ffmpeg aos processadores lógicos `cpus` (se der; nunca falha)."""
+    if not cpus:
+        return
+    try:
+        if os.name == "nt":
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            k32.SetProcessAffinityMask.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            mascara = sum(1 << c for c in cpus if c < 64)
+            if mascara:
+                k32.SetProcessAffinityMask(ctypes.c_void_p(int(proc._handle)), mascara)
+        elif hasattr(os, "sched_setaffinity"):
+            os.sched_setaffinity(proc.pid, cpus)
+    except Exception:
+        pass
+
 
 # Padrão visual C&C (derivado do logo)
 MARCADO, DESMARCADO = "\u2611", "\u2610"     # caixinhas da coluna de seleção da lista
@@ -252,11 +451,13 @@ class _Sinais:
         return any(s.is_set() for s in self.sinais)
 
 
-def _executar(cmd: list, cancelar=None, env=None) -> tuple[int, str]:
-    """Roda o comando até o fim (ou até o cancelamento). Devolve (código, texto de erro)."""
+def _executar(cmd: list, cancelar=None, env=None, cpus: list[int] | None = None) -> tuple[int, str]:
+    """Roda o comando até o fim (ou até o cancelamento). Devolve (código, texto de erro).
+    `cpus` restringe o processo aos processadores lógicos reservados ao vídeo."""
     with tempfile.TemporaryFile() as erros:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=erros,
                                 stdin=subprocess.DEVNULL, creationflags=SEM_JANELA, env=env)
+        _fixar_nucleos(proc, cpus)
         while True:
             try:
                 codigo = proc.wait(timeout=0.5)
@@ -298,7 +499,29 @@ def verificar_ferramentas(aj: Ajustes) -> None:
         raise Erro(f"falta a biblioteca {e.name}. Rode: pip install -r requirements.txt")
 
 
+_SONDAGENS: dict = {}
+_trava_sondagens = threading.Lock()
+
+
 def sondar(arquivo: Path) -> dict:
+    """Como _sondar(), guardando o resultado enquanto o arquivo não mudar (a 1ª passada do lote
+    sonda todos os vídeos e o processamento reaproveita)."""
+    try:
+        st = arquivo.stat()
+        chave = (str(arquivo), st.st_size, st.st_mtime_ns)
+    except OSError:
+        return _sondar(arquivo)
+    with _trava_sondagens:
+        if chave in _SONDAGENS:
+            return dict(_SONDAGENS[chave])
+    info = _sondar(arquivo)
+    if info:
+        with _trava_sondagens:
+            _SONDAGENS[chave] = dict(info)
+    return info
+
+
+def _sondar(arquivo: Path) -> dict:
     """Dados do primeiro fluxo de vídeo. {} se não houver vídeo legível."""
     # saída completa: os nomes das seções de -show_entries mudam entre versões do ffprobe
     cmd = [FFPROBE, "-v", "error", "-show_streams", "-show_format", "-of", "json", str(arquivo)]
@@ -458,7 +681,8 @@ def _tocam(a: Caixa, b: Caixa) -> bool:
     return a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]
 
 
-def analisar(origem: Path, info: dict, aj: Ajustes, detector, ao_progredir, cancelar) -> list[Amostra]:
+def analisar(origem: Path, info: dict, aj: Ajustes, detector, ao_progredir, cancelar,
+             cpus: list[int] | None = None) -> list[Amostra]:
     """Percorre o vídeo em baixa resolução e anota, por amostra, o movimento e os objetos."""
     import numpy as np
     largura, altura = _tamanho_analise(info, aj.lado_analise)
@@ -475,6 +699,7 @@ def analisar(origem: Path, info: dict, aj: Ajustes, detector, ao_progredir, canc
     with tempfile.TemporaryFile() as erros:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=erros, stdin=subprocess.DEVNULL,
                                 creationflags=SEM_JANELA, bufsize=tamanho)
+        _fixar_nucleos(proc, cpus)
         try:
             while True:
                 if cancelar.is_set():
@@ -678,7 +903,10 @@ def filtros_de_tempo(seg: Segmento, info: dict, aj: Ajustes) -> tuple[list, floa
     return filtros, fps
 
 
-def comando_do_trecho(origem: Path, seg: Segmento, saida: Path, info: dict, aj: Ajustes) -> list:
+def comando_do_trecho(origem: Path, seg: Segmento, saida: Path, info: dict, aj: Ajustes,
+                      threads: int = 0) -> list:
+    """Comando ffmpeg de um trecho. `threads` > 0 limita as threads do codificador (vários vídeos
+    ao mesmo tempo); 0 deixa o codificador usar o computador inteiro."""
     nome_ff, tem_roi, preset_padrao, opcao_qualidade = CODIFICADORES[aj.codec]
     fps_ativo = _fps_de_saida(info, aj)
     acelerar = aj.modo == "timelapse" and not seg.ativo
@@ -709,7 +937,11 @@ def comando_do_trecho(origem: Path, seg: Segmento, saida: Path, info: dict, aj: 
                    opcao_qualidade, str(aj.qp_fundo), "-pix_fmt", pix,
                    "-g", str(max(60, round(fps * 10)))]
     if aj.codec == "hevc":
-        codificador += ["-x265-params", "log-level=error"]
+        codificador += ["-x265-params", "log-level=error" + (f":pools={threads}" if threads else "")]
+    elif aj.codec == "h264" and threads:
+        codificador += ["-threads", str(threads)]
+    elif aj.codec == "av1" and threads and versao_svt() == 1:
+        codificador += ["-svtav1-params", f"lp={threads}"]
     if aj.codec != "av1":                          # cabeçalhos em cada quadro-chave: os trechos têm
         codificador += ["-bsf:v", "dump_extra=freq=keyframe"]   # parâmetros de taxa diferentes
     return [FFMPEG, "-hide_banner", "-nostdin", "-y", "-loglevel", "error",
@@ -718,10 +950,23 @@ def comando_do_trecho(origem: Path, seg: Segmento, saida: Path, info: dict, aj: 
             *(["-vf", ",".join(filtros)] if filtros else []), *codificador, *fim, str(saida)]
 
 
+def trechos_simultaneos(aj: Ajustes, cpus: list[int] | None) -> int:
+    """Trechos codificados (ou medidos) ao mesmo tempo dentro de um vídeo.
+    Sem `cpus`, vale o computador inteiro; com `cpus`, só os núcleos reservados a este vídeo."""
+    if aj.paralelo:
+        return aj.paralelo
+    if aj.codec.endswith("_qsv"):
+        return 2
+    if cpus:
+        return max(1, min(4, hardware().fisicos_em(cpus) // 2))
+    return max(1, min(4, (os.cpu_count() or 2) // 4))     # comportamento de um vídeo por vez
+
+
 def codificar_trechos(origem: Path, segmentos: list[Segmento], pasta: Path, info: dict, aj: Ajustes,
-                      ao_progredir, cancelar) -> list[Path]:
+                      ao_progredir, cancelar, cpus: list[int] | None = None) -> list[Path]:
     """Codifica os trechos em paralelo. Devolve os arquivos na ordem da linha do tempo."""
-    paralelo = aj.paralelo or (2 if aj.codec.endswith("_qsv") else max(1, min(4, (os.cpu_count() or 2) // 4)))
+    paralelo = trechos_simultaneos(aj, cpus)
+    threads = max(1, len(cpus) // paralelo) if cpus else 0
     total = sum(s.duracao for s in segmentos) or 1.0
     feito, trava = [0.0], threading.Lock()
     ambiente = dict(os.environ, SVT_LOG="1")
@@ -733,7 +978,8 @@ def codificar_trechos(origem: Path, segmentos: list[Segmento], pasta: Path, info
         if sinal.is_set():
             raise Cancelado()
         saida = pasta / f"trecho_{k:06d}.mkv"
-        codigo, erros = _executar(comando_do_trecho(origem, seg, saida, info, aj), sinal, ambiente)
+        codigo, erros = _executar(comando_do_trecho(origem, seg, saida, info, aj, threads), sinal,
+                                  ambiente, cpus)
         if codigo != 0 or not saida.exists() or saida.stat().st_size == 0:
             raise Erro(f"trecho {k} ({seg.inicio:.1f}s): " + _ultima_linha(erros, codigo))
         with trava:
@@ -752,7 +998,7 @@ def codificar_trechos(origem: Path, segmentos: list[Segmento], pasta: Path, info
 
 
 def _vmaf_do_trecho(exe: str, origem: Path, seg: Segmento, arquivo: Path, info: dict, aj: Ajustes,
-                    fios: int, cancelar, recorte: str = "") -> float | None:
+                    fios: int, cancelar, recorte: str = "", cpus: list[int] | None = None) -> float | None:
     """VMAF de um trecho: compara cada quadro codificado com o mesmo quadro do original."""
     escolha = ",".join(filtros_de_tempo(seg, info, aj)[0])
     igualar = "settb=1/1000,setpts=N*40,format=yuv420p" + recorte   # mesma numeração nos dois lados
@@ -761,7 +1007,7 @@ def _vmaf_do_trecho(exe: str, origem: Path, seg: Segmento, arquivo: Path, info: 
     cmd = [exe, "-hide_banner", "-nostdin", "-loglevel", "info", "-nostats", "-i", str(arquivo),
            "-ss", f"{seg.inicio:.6f}", "-t", f"{seg.duracao:.6f}", "-i", str(origem),
            "-lavfi", grafo, "-an", "-f", "null", "-"]
-    codigo, texto = _executar(cmd, cancelar)
+    codigo, texto = _executar(cmd, cancelar, cpus=cpus)
     achado = re.search(r"VMAF score:\s*([0-9.]+)", texto)
     return float(achado.group(1)) if codigo == 0 and achado else None
 
@@ -783,14 +1029,18 @@ def _media(pares: list) -> float | None:
 
 
 def medir_vmaf(origem: Path, segmentos: list[Segmento], arquivos: list[Path], info: dict, aj: Ajustes,
-               ao_progredir, cancelar) -> dict:
+               ao_progredir, cancelar, cpus: list[int] | None = None) -> dict:
     """Mede o VMAF de cada trecho (quadro inteiro e dentro da região) e devolve as médias.
 
     A comparação usa só os quadros mantidos: os quadros descartados na redução temporal não
     entram na conta, porque não existem na saída."""
     exe = ferramenta_vmaf()
-    paralelo = aj.paralelo or max(1, min(4, (os.cpu_count() or 2) // 4))
-    fios = max(1, (os.cpu_count() or 2) // paralelo)
+    if cpus:
+        paralelo = trechos_simultaneos(aj, cpus) if not aj.codec.endswith("_qsv") else 1
+        fios = max(1, len(cpus) // paralelo)
+    else:
+        paralelo = aj.paralelo or max(1, min(4, (os.cpu_count() or 2) // 4))
+        fios = max(1, (os.cpu_count() or 2) // paralelo)
     total = sum(s.duracao for s in segmentos) or 1.0
     feito, trava = [0.0], threading.Lock()
 
@@ -798,10 +1048,10 @@ def medir_vmaf(origem: Path, segmentos: list[Segmento], arquivos: list[Path], in
         seg, arquivo = par
         if cancelar.is_set():
             raise Cancelado()
-        seg.vmaf = _vmaf_do_trecho(exe, origem, seg, arquivo, info, aj, fios, cancelar)
+        seg.vmaf = _vmaf_do_trecho(exe, origem, seg, arquivo, info, aj, fios, cancelar, cpus=cpus)
         recorte = _recorte_da_regiao(seg, info)
         if recorte and seg.vmaf is not None:
-            seg.vmaf_roi = _vmaf_do_trecho(exe, origem, seg, arquivo, info, aj, fios, cancelar, recorte)
+            seg.vmaf_roi = _vmaf_do_trecho(exe, origem, seg, arquivo, info, aj, fios, cancelar, recorte, cpus)
         with trava:
             feito[0] += seg.duracao
             ao_progredir(min(1.0, feito[0] / total))
@@ -854,8 +1104,10 @@ def _sha256(arquivo: Path) -> str:
 
 
 def processar(origem: Path, destino: Path, aj: Ajustes, detector, ao_progredir=None,
-              ao_etapa=None, cancelar: threading.Event | None = None) -> Resultado:
-    """Analisa e codifica um vídeo. Grava o destino (.mp4) e o manifesto (.json) ao lado."""
+              ao_etapa=None, cancelar: threading.Event | None = None,
+              cpus: list[int] | None = None) -> Resultado:
+    """Analisa e codifica um vídeo. Grava o destino (.mp4) e o manifesto (.json) ao lado.
+    `cpus` = processadores lógicos reservados a este vídeo (None = o computador inteiro)."""
     ao_progredir = ao_progredir or (lambda p: None)
     ao_etapa = ao_etapa or (lambda texto: None)
     cancelar = cancelar or threading.Event()
@@ -876,7 +1128,7 @@ def processar(origem: Path, destino: Path, aj: Ajustes, detector, ao_progredir=N
         ao_etapa("Analisando")
         medir = aj.vmaf and not aj.mostrar_roi and ferramenta_vmaf() is not None
         p_analise, p_codificar = (0.25, 0.45) if medir else (0.30, 0.65)
-        amostras = analisar(origem, info, aj, detector, lambda p: ao_progredir(p_analise * p), cancelar)
+        amostras = analisar(origem, info, aj, detector, lambda p: ao_progredir(p_analise * p), cancelar, cpus)
         segmentos, eventos = montar_linha_do_tempo(amostras, info["duracao"], aj)
         res.eventos = len(eventos)
         res.ativo = sum(s.duracao for s in segmentos if s.ativo)
@@ -887,7 +1139,7 @@ def processar(origem: Path, destino: Path, aj: Ajustes, detector, ao_progredir=N
                 return res
         ao_etapa("Codificando")
         arquivos = codificar_trechos(origem, segmentos, pasta, info, aj,
-                                     lambda p: ao_progredir(p_analise + p_codificar * p), cancelar)
+                                     lambda p: ao_progredir(p_analise + p_codificar * p), cancelar, cpus)
         ao_etapa("Juntando")
         com_audio = aj.audio and aj.modo == "retencao" and info["audio"]
         juntar(arquivos, segmentos, origem, parcial, com_audio, pasta, cancelar)
@@ -904,7 +1156,7 @@ def processar(origem: Path, destino: Path, aj: Ajustes, detector, ao_progredir=N
         if medir:
             ao_etapa("Medindo VMAF")
             qualidade = medir_vmaf(origem, segmentos, arquivos, info, aj,
-                                   lambda p: ao_progredir(0.72 + 0.25 * p), cancelar)
+                                   lambda p: ao_progredir(0.72 + 0.25 * p), cancelar, cpus)
             res.vmaf, res.vmaf_roi = qualidade["geral"], qualidade["regioes"]
         try:
             st = origem.stat()
@@ -961,6 +1213,132 @@ def processar(origem: Path, destino: Path, aj: Ajustes, detector, ao_progredir=N
 # --------------------------------------------------------------------------
 # Lote e registro
 # --------------------------------------------------------------------------
+class PoolDetectores:
+    """Um detector por vídeo em processamento: o YOLO não pode ser usado por duas threads ao mesmo
+    tempo. O primeiro é criado já (e define o aviso e a descrição); os demais, só quando outro
+    vídeo começa e não há detector livre, até `maximo`."""
+
+    def __init__(self, aj: Ajustes, avisar, maximo: int):
+        self.aj, self.maximo = aj, max(1, maximo)
+        self.livres: queue.Queue = queue.Queue()
+        self.trava = threading.Lock()
+        primeiro = criar_detector(aj, avisar)        # pode levantar Erro: sem detector não há lote
+        self.descricao = getattr(primeiro, "descricao", "somente movimento")
+        self.ativo = primeiro is not None
+        self.criados = 1
+        if self.ativo:
+            self.livres.put(primeiro)
+            if self.maximo > 1 and "OpenVINO" not in self.descricao:
+                # PyTorch: as threads de cálculo são do processo inteiro; divide entre os vídeos.
+                try:
+                    import torch
+                    torch.set_num_threads(max(1, hardware().fisicos // self.maximo))
+                except Exception:
+                    pass
+
+    def pegar(self):
+        if not self.ativo:
+            return None
+        try:
+            return self.livres.get_nowait()
+        except queue.Empty:
+            pass
+        with self.trava:
+            criar = self.criados < self.maximo
+            if criar:
+                self.criados += 1
+        if criar:
+            try:
+                novo = criar_detector(self.aj, lambda texto: None)
+                if novo is not None:
+                    return novo
+            except Exception:
+                pass
+        return self.livres.get()                      # espera um detector ser devolvido
+
+    def devolver(self, detector) -> None:
+        if detector is not None:
+            self.livres.put(detector)
+
+
+def duracoes_a_processar(pares: list[tuple[Path, Path]], cancelar) -> list[float]:
+    """Segundos de vídeo de cada par, sondando vários arquivos ao mesmo tempo (0 se já reduzido)."""
+    def uma(par) -> float:
+        origem, destino = par
+        if cancelar.is_set() or destino.exists():
+            return 0.0
+        try:
+            return sondar(origem).get("duracao", 0.0)
+        except Exception:
+            return 0.0
+    with ThreadPoolExecutor(max_workers=SONDAGENS_SIMULTANEAS) as ex:
+        return list(ex.map(uma, pares))
+
+
+def processar_em_lote(pares: list[tuple[Path, Path]], raiz_log: Path, aj: Ajustes, jobs: int,
+                      detectores: PoolDetectores, cancelar, ao_inicio=None, ao_progredir=None,
+                      ao_etapa=None, ao_fim=None) -> list[Resultado]:
+    """Processa até `jobs` vídeos ao mesmo tempo, cada um preso ao seu grupo de núcleos e com o
+    seu detector. Os maiores começam primeiro. Os callbacks recebem o índice do par na lista.
+    Devolve os resultados na ordem original (sem os vídeos que nem chegaram a começar)."""
+    hw = hardware()
+    jobs = hw.limitar(jobs)
+    livres: queue.Queue = queue.Queue()
+    for grupo in (hw.grupos(jobs) if jobs > 1 else [None]):   # 1 vídeo: o computador inteiro
+        livres.put(grupo)
+    ferramenta_vmaf()
+    if aj.codec == "av1":
+        versao_svt()
+    resultados: dict[int, Resultado] = {}
+
+    def tam(i: int) -> int:
+        try:
+            return pares[i][0].stat().st_size
+        except OSError:
+            return 0
+
+    def rodar(i: int) -> None:
+        if cancelar.is_set():
+            return
+        cpus = livres.get()
+        detector = None
+        try:
+            if cancelar.is_set():
+                return
+            origem, destino = pares[i]
+            if ao_inicio:
+                ao_inicio(i)
+            try:
+                if not destino.exists():             # já reduzido: processar() só registra e sai
+                    detector = detectores.pegar()
+                r = processar(origem, destino, aj, detector,
+                              (lambda p: ao_progredir(i, p)) if ao_progredir else None,
+                              (lambda txt: ao_etapa(i, txt)) if ao_etapa else None, cancelar, cpus)
+            except Exception as e:                   # um arquivo ruim não derruba o lote
+                r = Resultado(origem, destino, "Erro", str(e))
+            if r.status != "Cancelado":
+                registrar(raiz_log, r, aj)
+            resultados[i] = r
+            if ao_fim:
+                ao_fim(i, r)
+        finally:
+            detectores.devolver(detector)
+            livres.put(cpus)
+
+    ordem = sorted(range(len(pares)), key=tam, reverse=True)
+    ex = ThreadPoolExecutor(max_workers=jobs)
+    try:
+        pendentes = {ex.submit(rodar, i) for i in ordem}
+        while pendentes:     # espera em fatias curtas para o Ctrl+C funcionar também no Windows
+            _, pendentes = wait(pendentes, timeout=0.5)
+    except BaseException:
+        cancelar.set()
+        raise
+    finally:
+        ex.shutdown(wait=True)
+    return [resultados[i] for i in range(len(pares)) if i in resultados]
+
+
 def planejar(alvo: Path, subpastas: bool, pasta_saida: Path | None) -> tuple[Path, list[tuple[Path, Path]]]:
     """Lista (origem, destino) para um arquivo ou para os vídeos de uma pasta."""
     if alvo.is_file():
@@ -980,8 +1358,17 @@ def planejar(alvo: Path, subpastas: bool, pasta_saida: Path | None) -> tuple[Pat
     return raiz, pares
 
 
+_trava_log = threading.Lock()
+
+
 def registrar(raiz: Path, r: Resultado, aj: Ajustes) -> None:
-    """Acrescenta uma linha ao CSV de controle (abre direto no Excel pt-BR)."""
+    """Acrescenta uma linha ao CSV de controle (abre direto no Excel pt-BR).
+    Seguro com vários vídeos terminando ao mesmo tempo."""
+    with _trava_log:
+        _registrar(raiz, r, aj)
+
+
+def _registrar(raiz: Path, r: Resultado, aj: Ajustes) -> None:
     caminho = raiz / NOME_LOG
     novo = not caminho.exists()
     try:
@@ -1501,8 +1888,8 @@ def rodar_gui() -> int:
 
     janela = tk.Tk()
     janela.title(f"C&C - {TITULO} {VERSAO}")
-    janela.geometry("1180x790")
-    janela.minsize(1000, 660)
+    janela.geometry("1180x850")
+    janela.minsize(1000, 700)
     janela.configure(bg=FUNDO)
 
     # ---- padrão visual C&C ----
@@ -1558,8 +1945,8 @@ def rodar_gui() -> int:
     eventos: queue.Queue = queue.Queue()
     cancelar = threading.Event()
     estado = {"rodando": False, "total": 0, "t0": None, "durs": [], "dur_total": 0.0,
-              "dur_feita": 0.0, "dur_atual": 0.0, "p_atual": 0.0, "resultados": {}, "pares": [],
-              "tamanhos": [],
+              "dur_feita": 0.0, "andamento": {}, "etapas": {}, "n_fim": 0, "jobs": 1,
+              "resultados": {}, "pares": [], "tamanhos": [],
               "escolha": None}     # lista para escolher: {"chave", "raiz", "itens": [[origem, bytes, marcado]]}
 
     padrao = Ajustes()
@@ -1580,6 +1967,9 @@ def rodar_gui() -> int:
     tem_vmaf = ferramenta_vmaf() is not None
     # Uma opção ou outra, nunca as duas: desenhar as regiões no vídeo impede medir o VMAF.
     v_verificacao = tk.StringVar(value="vmaf")
+    hw = hardware()
+    v_jobs = tk.IntVar(value=hw.sugerido)
+    v_jobs_dica = tk.StringVar()
     v_status = tk.StringVar(value="Escolha uma pasta para listar os vídeos.")
     v_eta = tk.StringVar(value="será calculado ao iniciar o processamento")
 
@@ -1668,6 +2058,34 @@ def rodar_gui() -> int:
     ttk.Radiobutton(linha4, text="Desenhar as regiões no vídeo (confere a detecção; sem VMAF)",
                     variable=v_verificacao, value="regioes").pack(side="left", padx=(22, 0))
 
+    linha5 = ttk.Frame(topo)
+    linha5.grid(row=9, column=0, columnspan=3, sticky="w", pady=(8, 0))
+    ttk.Label(linha5, text="Vídeos simultâneos:", style="Rotulo.TLabel").pack(side="left")
+    ttk.Spinbox(linha5, from_=1, to=hw.maximo, width=4, textvariable=v_jobs,
+                command=lambda: atualizar_dica_jobs()).pack(side="left", padx=(6, 6))
+    ttk.Label(linha5, textvariable=v_jobs_dica, style="Dica.TLabel").pack(side="left")
+    ttk.Label(topo, text=hw.descricao(), style="Dica.TLabel").grid(row=10, column=0, columnspan=3,
+                                                                   sticky="w", pady=(2, 0))
+
+    def ler_jobs() -> int | None:
+        try:
+            return int(v_jobs.get())
+        except (tk.TclError, ValueError):
+            return None
+
+    def atualizar_dica_jobs(*_):
+        jobs = ler_jobs()
+        if jobs is None or jobs < 1:
+            v_jobs_dica.set(f"de 1 a {hw.maximo}  (sugerido {hw.sugerido})")
+            return
+        extra = f"   acima do máximo, será usado {hw.maximo}" if jobs > hw.maximo else ""
+        jobs = hw.limitar(jobs)
+        v_jobs_dica.set(f"~{hw.threads_por_conversao(jobs)} núcleo(s) físico(s) por vídeo   "
+                        f"(sugerido {hw.sugerido}, máximo {hw.maximo}){extra}")
+
+    v_jobs.trace_add("write", atualizar_dica_jobs)
+    atualizar_dica_jobs()
+
     # Rodapé antes da tabela, para a tabela ocupar o espaço que sobrar.
     base = ttk.Frame(janela, padding=(14, 8, 14, 12))
     base.pack(side="bottom", fill="x")
@@ -1692,7 +2110,7 @@ def rodar_gui() -> int:
     tabela.pack(side="left", fill="both", expand=True)
     barra_rol.pack(side="right", fill="y")
 
-    ttk.Label(base, text="Arquivo atual:").grid(row=0, column=0, sticky="w")
+    ttk.Label(base, text="Em andamento:").grid(row=0, column=0, sticky="w")
     p_arquivo = ttk.Progressbar(base, maximum=1.0)
     p_arquivo.grid(row=0, column=1, sticky="ew", padx=8, pady=3)
     ttk.Label(base, text="Total:").grid(row=1, column=0, sticky="w")
@@ -1731,7 +2149,8 @@ def rodar_gui() -> int:
         if not estado["rodando"] or estado["t0"] is None:
             return
         decorrido = time.monotonic() - estado["t0"]
-        feito = estado["dur_feita"] + estado["dur_atual"] * estado["p_atual"]
+        feito = estado["dur_feita"] + sum(estado["durs"][i] * p for i, p in estado["andamento"].items()
+                                          if i < len(estado["durs"]))
         if estado["dur_total"] <= 0:
             v_eta.set("nada a converter")
         elif feito <= 0 or decorrido < 3:
@@ -1741,46 +2160,35 @@ def rodar_gui() -> int:
             v_eta.set(f"total ~{tempo(total)}   |   restante ~{tempo(total - decorrido)}   |   "
                       f"decorrido {tempo(decorrido)}")
 
-    def trabalhador(raiz_log, pares, aj):
-        durs = []
-        for origem, destino in pares:            # 1ª passada: quanto vídeo há para processar
-            try:
-                durs.append(0.0 if destino.exists() else sondar(origem).get("duracao", 0.0))
-            except Exception:
-                durs.append(0.0)
-        eventos.put(("duracoes", durs))
-        avisos = []
+    def trabalhador(raiz_log, pares, aj, jobs):
+        resultados: list[Resultado] = []
         try:
-            detector = criar_detector(aj, avisos.append)
-        except Exception as e:                   # sem detector não há o que fazer
-            eventos.put(("falha", str(e)))
-            return
-        eventos.put(("detector", getattr(detector, "descricao", "somente movimento"), avisos))
-        resultados = []
-        for i, (origem, destino) in enumerate(pares):
-            if cancelar.is_set():
-                break
-            eventos.put(("inicio", i))
-            ultimo = [-1]
+            # 1ª passada (vários arquivos ao mesmo tempo): quanto vídeo há para processar.
+            eventos.put(("duracoes", duracoes_a_processar(pares, cancelar)))
+            avisos = []
+            try:
+                detectores = PoolDetectores(aj, avisos.append, jobs)
+            except Exception as e:               # sem detector não há o que fazer
+                eventos.put(("falha", str(e)))
+                return
+            eventos.put(("detector", detectores.descricao, avisos))
+            ultimo: dict[int, int] = {}
 
-            def progresso(p, i=i, ultimo=ultimo):
-                if int(p * 500) != ultimo[0]:    # a análise avisa a cada amostra: não inunda a fila
-                    ultimo[0] = int(p * 500)
+            def progresso(i, p):
+                if int(p * 500) != ultimo.get(i):    # a análise avisa a cada amostra: não inunda a fila
+                    ultimo[i] = int(p * 500)
                     eventos.put(("progresso", i, p))
 
-            try:
-                r = processar(origem, destino, aj, detector, progresso,
-                              lambda txt, i=i: eventos.put(("etapa", i, txt + "...")), cancelar)
-            except Exception as e:               # um arquivo ruim não derruba o lote
-                r = Resultado(origem, destino, "Erro", str(e))
-            if r.status != "Cancelado":
-                registrar(raiz_log, r, aj)
-            resultados.append(r)
-            eventos.put(("fim", i, r))
-        eventos.put(("acabou", resultados))
+            resultados = processar_em_lote(
+                pares, raiz_log, aj, jobs, detectores, cancelar,
+                ao_inicio=lambda i: eventos.put(("inicio", i)), ao_progredir=progresso,
+                ao_etapa=lambda i, txt: eventos.put(("etapa", i, txt + "...")),
+                ao_fim=lambda i, r: eventos.put(("fim", i, r)))
+        finally:
+            eventos.put(("acabou", resultados))
 
     def ler_ajustes():
-        """Monta e confere os ajustes da tela. Devolve (pasta de saída, Ajustes) ou None."""
+        """Monta e confere os ajustes da tela. Devolve (pasta de saída, Ajustes, vídeos simultâneos) ou None."""
         saida = None
         if v_onde.get() == "pasta":
             if not v_saida.get().strip():
@@ -1806,9 +2214,17 @@ def rodar_gui() -> int:
         except Erro as e:
             messagebox.showerror("Ajustes", str(e), parent=janela)
             return None
-        return saida, aj
+        jobs = ler_jobs()
+        if jobs is None or jobs < 1:
+            messagebox.showwarning("Ajustes", f"Vídeos simultâneos: informe um número de 1 a {hw.maximo}.",
+                                   parent=janela)
+            return None
+        if jobs > hw.maximo:
+            v_jobs.set(hw.maximo)
+            jobs = hw.maximo
+        return saida, aj, jobs
 
-    def disparar(pares, raiz, raiz_log, aj):
+    def disparar(pares, raiz, raiz_log, aj, jobs):
         """Preenche a tabela e inicia o processamento."""
         tabela.delete(*tabela.get_children())
         tamanhos = []
@@ -1823,15 +2239,17 @@ def rodar_gui() -> int:
         cancelar.clear()
         estado["escolha"] = None                 # a tabela passa a mostrar o andamento
         tabela.heading("sel", text="")
-        estado.update(rodando=True, total=len(pares), t0=None, durs=[], dur_total=0.0, dur_feita=0.0,
-                      dur_atual=0.0, p_atual=0.0, resultados={}, pares=pares, tamanhos=tamanhos)
+        jobs = min(hw.limitar(jobs), len(pares))
+        estado.update(rodando=True, total=len(pares), t0=None, durs=[0.0] * len(pares), dur_total=0.0,
+                      dur_feita=0.0, andamento={}, etapas={}, n_fim=0, jobs=jobs, resultados={},
+                      pares=pares, tamanhos=tamanhos)
         atualizar_total()
         p_arquivo["value"] = p_total["value"] = 0
         b_iniciar.configure(state="disabled")
         b_cancelar.configure(state="normal")
         v_status.set("Carregando o detector...")
         v_eta.set("analisando os arquivos...")
-        threading.Thread(target=trabalhador, args=(raiz_log, pares, aj), daemon=True).start()
+        threading.Thread(target=trabalhador, args=(raiz_log, pares, aj, jobs), daemon=True).start()
 
     # ---- lista da pasta, com caixinha para escolher o que processar ----
     def chave_da_pasta():
@@ -1934,13 +2352,13 @@ def rodar_gui() -> int:
         lidos = ler_ajustes()
         if not lidos:
             return
-        saida, aj = lidos
+        saida, aj, jobs = lidos
         pares = [p for p in planejar(raiz.resolve(), v_sub.get(), saida)[1] if p[0] in marcados]
         if not pares:
             messagebox.showwarning("Iniciar", "Os vídeos marcados não estão mais disponíveis na pasta.",
                                    parent=janela)
             return
-        disparar(pares, raiz, saida or raiz, aj)
+        disparar(pares, raiz, saida or raiz, aj, jobs)
 
     def pedir_cancelamento():
         cancelar.set()
@@ -1952,6 +2370,16 @@ def rodar_gui() -> int:
         b_iniciar.configure(state="normal")
         b_cancelar.configure(state="disabled")
         v_status.set(texto)
+
+    def atualizar_andamento():
+        """Barras e situação com vários vídeos ao mesmo tempo."""
+        andamento = estado["andamento"]
+        p_arquivo["value"] = sum(andamento.values()) / len(andamento) if andamento else 0
+        if estado["total"]:
+            p_total["value"] = (estado["n_fim"] + sum(andamento.values())) / estado["total"]
+        if estado["rodando"] and not cancelar.is_set():
+            v_status.set(f"Concluídos {estado['n_fim']} de {estado['total']}  ·  {len(andamento)} em andamento "
+                         f"(até {estado['jobs']} ao mesmo tempo).  Detector: {estado.get('detector', '')}")
 
     def processar_eventos():
         try:
@@ -1967,18 +2395,20 @@ def rodar_gui() -> int:
                     v_eta.set("processamento não iniciado")
                     messagebox.showerror("Detector", ev[1], parent=janela)
                 elif ev[0] == "inicio":
+                    estado["andamento"][ev[1]] = 0.0
+                    estado["etapas"][ev[1]] = "Iniciando..."
                     tabela.set(str(ev[1]), "status", "Iniciando...")
                     tabela.see(str(ev[1]))
-                    p_arquivo["value"] = 0
-                    estado.update(dur_atual=estado["durs"][ev[1]], p_atual=0.0)
-                    v_status.set(f"Processando {ev[1] + 1} de {estado['total']}.  "
-                                 f"Detector: {estado.get('detector', '')}")
+                    atualizar_andamento()
                 elif ev[0] == "etapa":
+                    estado["etapas"][ev[1]] = ev[2]
                     tabela.set(str(ev[1]), "status", ev[2])
                 elif ev[0] == "progresso":
-                    p_arquivo["value"] = ev[2]
-                    p_total["value"] = (ev[1] + ev[2]) / estado["total"]
-                    estado["p_atual"] = ev[2]
+                    if ev[1] in estado["andamento"]:
+                        estado["andamento"][ev[1]] = ev[2]
+                        tabela.set(str(ev[1]), "status",
+                                   f"{estado['etapas'].get(ev[1], '')}  {ev[2] * 100:.0f}%".strip())
+                        atualizar_andamento()
                 elif ev[0] == "fim":
                     i, r = ev[1], ev[2]
                     tabela.set(str(i), "status", r.status + (f" - {r.detalhe}" if r.detalhe else ""))
@@ -1993,10 +2423,12 @@ def rodar_gui() -> int:
                         tabela.set(str(i), "vmaf", f"{r.vmaf:.1f}")
                     if r.vmaf_roi is not None:
                         tabela.set(str(i), "vmaf_roi", f"{r.vmaf_roi:.1f}")
-                    p_total["value"] = (i + 1) / estado["total"]
-                    estado["dur_feita"] += estado["durs"][i]
-                    estado.update(dur_atual=0.0, p_atual=0.0)
+                    estado["andamento"].pop(i, None)
+                    estado["etapas"].pop(i, None)
+                    estado["n_fim"] += 1
+                    estado["dur_feita"] += estado["durs"][i] if i < len(estado["durs"]) else 0.0
                     estado["resultados"][i] = r
+                    atualizar_andamento()
                     atualizar_total()
                 elif ev[0] == "acabou":
                     decorrido = time.monotonic() - estado["t0"] if estado["t0"] else 0
@@ -2060,7 +2492,12 @@ def ler_argumentos(argv=None) -> tuple[argparse.Namespace, Ajustes]:
     p.add_argument("--confianca", type=float, default=padrao.confianca)
     p.add_argument("--dispositivo", default="", help="onde rodar o YOLO, repassado à ultralytics (ex.: cpu, 0, xpu, intel:gpu)")
     p.add_argument("--sem-audio", action="store_true")
-    p.add_argument("--paralelo", type=int, default=0, help="trechos codificados ao mesmo tempo")
+    p.add_argument("--jobs", type=int, default=None,
+                   help="vídeos processados ao mesmo tempo (padrão: o sugerido para este computador; "
+                        "acima do máximo, usa o máximo)")
+    p.add_argument("--hardware", action="store_true",
+                   help="mostra o processador detectado e os limites de vídeos simultâneos, e sai")
+    p.add_argument("--paralelo", type=int, default=0, help="trechos de um vídeo codificados ao mesmo tempo")
     p.add_argument("--mostrar-roi", action="store_true", help="desenha as regiões no vídeo (diagnóstico)")
     p.add_argument("--sem-hash", action="store_true", help="não calcula o SHA-256 dos arquivos")
     p.add_argument("--sem-vmaf", action="store_true", help="não mede o índice VMAF (mais rápido)")
@@ -2081,6 +2518,12 @@ def ler_argumentos(argv=None) -> tuple[argparse.Namespace, Ajustes]:
 
 def main(argv=None) -> int:
     args, aj = ler_argumentos(argv)
+    if args.hardware:
+        hw = hardware()
+        print(hw.descricao())
+        print(f"Vídeos simultâneos: sugerido {hw.sugerido}, máximo {hw.maximo} "
+              f"(~{hw.threads_por_conversao(hw.sugerido)} núcleo(s) físico(s) por vídeo no sugerido).")
+        return 0
     if args.registros is not None:
         return imprimir_registros(args.registros, args.situacao)
     if args.alvo is None:
@@ -2095,38 +2538,58 @@ def main(argv=None) -> int:
         raiz, pares = planejar(alvo, args.subpastas, pasta_saida)
         if not pares:
             raise Erro("nenhum vídeo para processar.")
-        detector = criar_detector(aj, print)
+        hw = hardware()
+        jobs = hw.sugerido if args.jobs is None else args.jobs
+        if jobs > hw.maximo:
+            print(f"Aviso: --jobs {jobs} passa do máximo deste computador; usando {hw.maximo}.")
+        jobs = min(hw.limitar(jobs), len(pares))
+        detectores = PoolDetectores(aj, print, jobs)
     except Erro as e:
         print(f"Erro: {e}", file=sys.stderr)
         return 2
     print(f"{TITULO} {VERSAO}")
-    print(f"Modo {aj.modo}, codec {CODIFICADORES[aj.codec][0]}, detector: "
-          f"{getattr(detector, 'descricao', 'somente movimento')}")
+    print(f"Modo {aj.modo}, codec {CODIFICADORES[aj.codec][0]}, detector: {detectores.descricao}")
+    print(f"{hw.descricao()}\n{jobs} vídeo(s) ao mesmo tempo (sugerido {hw.sugerido}, máximo {hw.maximo}), "
+          f"~{hw.threads_por_conversao(jobs)} núcleo(s) físico(s) cada.")
     if not CODIFICADORES[aj.codec][1]:
         print("Aviso: este codec não aplica o ROI por QP; só a redução temporal será usada.")
     if aj.vmaf and ferramenta_vmaf() is None:
         print("Aviso: este ffmpeg não tem o filtro libvmaf; a qualidade não será medida.")
     elif aj.vmaf and aj.mostrar_roi:
         print("Aviso: com as regiões desenhadas no vídeo, o VMAF não é medido.")
-    cancelar, resultados = threading.Event(), []
-    try:
-        for k, (origem, destino) in enumerate(pares, 1):
-            estado = {"etapa": "", "ultimo": -1}
+    cancelar = threading.Event()
+    trava = threading.Lock()
+    andamento: dict[int, tuple[str, float]] = {}
+    contagem = [0]
+    largura = max(40, min(shutil.get_terminal_size((100, 20)).columns - 1, 170))
 
-            def etapa(texto):
-                estado["etapa"] = texto
+    def linha_andamento():
+        partes = [f"{pares[i][0].name[:24]} {etapa} {p * 100:3.0f}%" for i, (etapa, p) in sorted(andamento.items())]
+        texto = f"[{contagem[0]}/{len(pares)}] " + "  |  ".join(partes)
+        print("\r" + texto[:largura].ljust(largura), end="", flush=True)
 
-            def progresso(p):
-                pct = int(p * 100)
-                if pct != estado["ultimo"]:
-                    estado["ultimo"] = pct
-                    print(f"\r[{k}/{len(pares)}] {origem.name[:48]}: {estado['etapa']} {pct:3d}%   ",
-                          end="", flush=True)
+    def ao_inicio(i):
+        with trava:
+            andamento[i] = ("", 0.0)
+            linha_andamento()
 
-            r = processar(origem, destino, aj, detector, progresso, etapa, cancelar)
-            resultados.append(r)
-            registrar(pasta_saida or raiz, r, aj)
-            linha = f"\r[{k}/{len(pares)}] {origem.name[:48]}: {r.status}"
+    def ao_etapa(i, texto):
+        with trava:
+            if i in andamento:
+                andamento[i] = (texto, andamento[i][1])
+                linha_andamento()
+
+    def ao_progredir(i, p):
+        with trava:
+            if i in andamento and int(p * 100) != int(andamento[i][1] * 100):
+                andamento[i] = (andamento[i][0], p)
+                linha_andamento()
+
+    def ao_fim(i, r):
+        with trava:
+            andamento.pop(i, None)
+            contagem[0] += 1
+            linha = f"[{contagem[0]}/{len(pares)}] {r.origem.name[:48]}: {r.status}"
             if r.reducao is not None and r.status in ("Convertido", "Sem ganho"):
                 linha += (f" - {tamanho(r.tam_origem)} -> {tamanho(r.tam_destino)} ({r.reducao:.1f}% menor), "
                           f"{r.eventos} evento(s), {tempo(r.ativo)} ativos de {tempo(r.duracao)}, "
@@ -2135,9 +2598,14 @@ def main(argv=None) -> int:
                     linha += f", VMAF {r.vmaf:.1f}" + (f" (regiões {r.vmaf_roi:.1f})" if r.vmaf_roi is not None else "")
             elif r.detalhe:
                 linha += f" - {r.detalhe}"
-            print(linha + " " * 12)
+            print("\r" + linha.ljust(largura))
+            if andamento:
+                linha_andamento()
+
+    try:
+        resultados = processar_em_lote(pares, pasta_saida or raiz, aj, jobs, detectores, cancelar,
+                                       ao_inicio, ao_progredir, ao_etapa, ao_fim)
     except KeyboardInterrupt:
-        cancelar.set()
         print("\nCancelado.")
         return 130
     feitos = [r for r in resultados if r.status == "Convertido"]

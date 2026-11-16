@@ -57,6 +57,8 @@ python motor_roi.py camera1.mp4 --modo eventos        # só os eventos
 python motor_roi.py camera1.mp4 --mostrar-roi         # desenha as regiões (para conferir a detecção)
 python motor_roi.py camera1.mp4 --detector openvino --dispositivo xpu   # GPU Intel
 python motor_roi.py --help
+python motor_roi.py --hardware                        # processador detectado e limites
+python motor_roi.py "C:\Videos" --jobs 3              # 3 vídeos ao mesmo tempo
 ```
 
 Sem argumentos, o programa abre a janela: escolha a pasta, marque os vídeos, ajuste modo, codec, detector, qualidade por região e quadros por segundo, e clique em Iniciar. As opções menos usadas (`--janela`, `--antes`, `--depois`, `--sensibilidade`, `--lado-analise`, `--modelo`, `--dispositivo`) ficam só na linha de comando.
@@ -68,6 +70,21 @@ Para cada vídeo são gravados, ao lado do original:
 - `motor_roi_log.csv`: uma linha por vídeo processado, com as notas VMAF.
 
 O original nunca é alterado nem apagado.
+
+## Vídeos simultâneos
+
+O programa detecta o processador (núcleos físicos) e a memória e processa vários vídeos ao mesmo
+tempo. Cada vídeo fica preso ao seu grupo de núcleos (análise, codificação dos trechos e VMAF) e
+usa o seu próprio detector YOLO, porque o mesmo modelo não pode atender duas análises ao mesmo tempo.
+
+- **Sugerido:** cerca de 4 núcleos físicos por vídeo.
+- **Máximo:** pelo menos 2 núcleos físicos e 3 GB de RAM por vídeo.
+- Na janela, o campo "Vídeos simultâneos" aceita de 1 até o máximo; no terminal, `--jobs N`
+  (sem a opção, usa o sugerido; acima do máximo, usa o máximo).
+- Os maiores arquivos começam primeiro.
+- `--paralelo` continua valendo para os trechos de cada vídeo; sem ele, o número de trechos
+  simultâneos é calculado pelos núcleos reservados ao vídeo.
+- Com 1 vídeo por vez, o comportamento é o mesmo das versões anteriores.
 
 ## Consulta dos registros
 
@@ -102,7 +119,7 @@ O instalador é montado do zero por `instalador\montar_instalador.ps1`. O script
 **No próprio PC** (precisa de internet e do [NSIS](https://nsis.sourceforge.io)):
 
 ```
-powershell -ExecutionPolicy Bypass -File instalador\montar_instalador.ps1 -Tipo roi
+powershell -ExecutionPolicy Bypass -File instalador\montar_instalador.ps1
 ```
 
 As pastas `build\` e `dist\` não vão para o repositório.

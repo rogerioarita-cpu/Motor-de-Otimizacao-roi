@@ -1,19 +1,19 @@
 ﻿<#
-  Monta o instalador do Compactador de Vídeos (AV1) ou do Motor ROI, do zero:
+  Monta o instalador do Motor ROI, do zero:
     - Python + Tkinter e ffmpeg (com x264, x265 e SVT-AV1) vindos do conda-forge, pelo micromamba;
     - ffvmaf (ffmpeg com libvmaf) vindo do pacote imageio-ffmpeg do PyPI;
-    - só no ROI: NumPy, OpenCV, PyTorch (CPU), ultralytics e o modelo yolov8n.pt;
-    - empacota tudo com o NSIS em dist\<instalador>_<versão>.exe.
+    - NumPy, OpenCV, PyTorch (CPU), ultralytics e o modelo yolov8n.pt;
+    - empacota tudo com o NSIS em dist\Instalar_Motor_ROI_CC_<versão>.exe.
+  O instalador do Compactador de Vídeos (AV1) é montado no repositório dele (Motor-de-Otimizacao).
 
   Uso (PowerShell, na pasta do projeto):
-    powershell -ExecutionPolicy Bypass -File instalador\montar_instalador.ps1 -Tipo av1
-    powershell -ExecutionPolicy Bypass -File instalador\montar_instalador.ps1 -Tipo roi
+    powershell -ExecutionPolicy Bypass -File instalador\montar_instalador.ps1
 
   A versão vem da constante VERSAO do programa. Precisa de internet e do NSIS (makensis);
   no GitHub Actions (.github\workflows\instalador.yml) roda sozinho a cada versão nova.
 #>
 param(
-    [Parameter(Mandatory = $true)][ValidateSet("av1", "roi")][string]$Tipo,
+    [ValidateSet("roi")][string]$Tipo = "roi",
     [string]$Versao = "",
     [string]$Python = "3.12"
 )
@@ -22,12 +22,8 @@ $ProgressPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $raiz = Split-Path -Parent $PSScriptRoot
-$cfg = @{
-    av1 = @{ Fonte = "conversor_av1.py"; Programa = "compactador.pyw"; Nsi = "instalador_av1.nsi"
-             Saida = "Instalar_Compactador_de_Videos_CC"; Codecs = @("libsvtav1") }
-    roi = @{ Fonte = "motor_roi.py"; Programa = "motor_roi.pyw"; Nsi = "instalador_roi.nsi"
-             Saida = "Instalar_Motor_ROI_CC"; Codecs = @("libx265", "libx264", "libsvtav1") }
-}[$Tipo]
+$cfg = @{ Fonte = "motor_roi.py"; Programa = "motor_roi.pyw"; Nsi = "instalador_roi.nsi"
+         Saida = "Instalar_Motor_ROI_CC"; Codecs = @("libx265", "libx264", "libsvtav1") }
 
 $fonte = Join-Path $raiz $cfg.Fonte
 if (-not $Versao) {
