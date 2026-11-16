@@ -1,4 +1,12 @@
 __pycache__/
 *.pyc
 venv/
-compactacao_log.csv
+.venv/
+motor_roi_log.csv
+*.pt
+*.onnx
+*_openvino_model/
+.roi_*/
+*.exe
+build/
+dist/

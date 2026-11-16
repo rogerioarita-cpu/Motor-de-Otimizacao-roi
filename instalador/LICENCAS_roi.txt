@@ -1,0 +1,12 @@
+Motor de Otimizacao e Retencao com ROI (C&C) - componentes de terceiros
+
+FFmpeg (ffmpeg.exe, ffprobe.exe, ffvmaf.exe e DLLs em motor\ffmpeg)
+  Compilacoes com --enable-gpl, distribuidas sob a GNU GPL versao 3.
+  Codigo-fonte: https://ffmpeg.org  |  Origem dos binarios: conda-forge e imageio-ffmpeg.
+x265 e x264: GNU GPL  |  SVT-AV1: BSD 3-Clause Clear  |  libvmaf: BSD+Patent
+Python 3.12 e Tcl/Tk (motor\python): Python Software Foundation License e licenca Tcl/Tk. Origem: conda-forge.
+
+Bibliotecas Python (motor\python\Lib\site-packages), origem PyPI:
+  Ultralytics YOLO e modelo yolov8n.pt: GNU AGPL versao 3 (https://github.com/ultralytics/ultralytics)
+  PyTorch e torchvision: BSD 3-Clause  |  OpenCV: Apache 2.0  |  NumPy: BSD 3-Clause
+  Demais dependencias: ver os arquivos *.dist-info de cada pacote.

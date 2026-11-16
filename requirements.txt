@@ -1,0 +1,6 @@
+numpy
+opencv-python
+
+# Opcionais: detecção de pessoas e veículos (YOLOv8) e aceleração Intel (OpenVINO)
+# ultralytics
+# openvino

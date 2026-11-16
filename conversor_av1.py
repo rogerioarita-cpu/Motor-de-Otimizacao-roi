@@ -30,6 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 TITULO = "Compactador de Vídeos"
+VERSAO = "1.1.0"          # ao mudar, o GitHub Actions gera e publica o instalador novo
 EXTENSOES = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".wmv", ".flv", ".webm",
              ".mpg", ".mpeg", ".ts", ".mts", ".m2ts", ".3gp"}
 FAMILIA_MP4 = {".mp4", ".mov", ".m4v", ".3gp"}
@@ -483,6 +484,7 @@ def registrar(raiz: Path, r: Resultado) -> None:
             w.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(r.tarefa.origem),
                         str(r.tarefa.destino), r.bytes_origem, r.bytes_destino or "", red,
                         r.status, r.mensagem, nota])
+        lembrar_log(caminho)
     except OSError:
         pass   # log é auxiliar; nunca interrompe a conversão
 
@@ -557,6 +559,432 @@ def rodar_cli(args) -> int:
     return 1 if any(r.status == "Erro" for r in resultados) else 0
 
 
+# Colunas da consulta: as mesmas da tela de conversão, com a data e hora na frente.
+ID_APP = "compactador"
+CHAVE_DATA, CHAVE_ARQUIVO, CHAVE_SAIDA, CHAVE_MSG = "data_hora", "original", "reduzido", "mensagem"
+COLUNAS_REG = (("data", "Data/hora", 135, "w"), ("arquivo", "Arquivo", 300, "w"),
+               ("status", "Situação", 230, "w"), ("original", "Original", 90, "e"),
+               ("reduzido", "Reduzido", 90, "e"), ("reducao", "Redução", 95, "e"), ("vmaf", "VMAF", 95, "e"))
+
+
+def registro_para_tela(r: dict) -> tuple[tuple, tuple]:
+    """(valores exibidos, chaves de ordenação) de uma linha do CSV."""
+    nome = Path(r.get("original", "")).name
+    st, msg = r.get("status", ""), r.get("mensagem", "")
+    orig, red = _reg_num(r.get("bytes_original", "")), _reg_num(r.get("bytes_reduzido", ""))
+    pct, nota = _reg_num(r.get("reducao_pct", "")), _reg_num(r.get("vmaf", ""))
+    valores = (_reg_data_txt(r), nome, st + (f" - {msg}" if msg else ""),
+               tamanho(int(orig)) if orig else "", tamanho(int(red)) if red else "",
+               f"{pct:.0f}%" if pct is not None else "", f"{nota:.1f}" if nota is not None else "")
+    chaves = (r["_data"] or datetime.min, nome.lower(), st.lower(), orig or 0, red or 0, _reg_k(pct), _reg_k(nota))
+    return valores, chaves
+
+
+def total_registros(regs: list) -> tuple:
+    """Última linha, como na tela de conversão: totais e médias."""
+    feitos = [r for r in regs if r.get("status") in ("Convertido", "Sem ganho")]
+    original = sum(_reg_num(r.get("bytes_original", "")) or 0 for r in regs)
+    reduzido = sum(_reg_num(r.get("bytes_reduzido", "")) or 0 for r in feitos)
+    media, nota = _reg_media(feitos, "reducao_pct"), _reg_media(feitos, "vmaf")
+    return ("", f"TOTAL  ({len(regs)} registro(s))", f"{len(feitos)} convertido(s) de {len(regs)}",
+            tamanho(int(original)), tamanho(int(reduzido)) if feitos else "",
+            f"média {media:.0f}%" if media is not None else "", f"média {nota:.1f}" if nota is not None else "")
+
+
+# --------------------------------------------------------------------------
+# Consulta dos registros (CSV de controle gravado em cada pasta processada)
+# --------------------------------------------------------------------------
+PASTA_CONFIG = Path(os.environ.get("APPDATA") or (Path.home() / ".config")) / "CC" / ID_APP
+INDICE_LOGS = PASTA_CONFIG / "registros_conhecidos.txt"
+SITUACOES = ("Convertido", "Sem ganho", "Ignorado", "Erro")
+_LEMBRADOS: set = set()
+_TRAVA_INDICE = threading.Lock()
+
+
+def logs_conhecidos(so_existentes: bool = True) -> list[Path]:
+    """CSVs de controle já gravados por este programa (o índice fica no perfil do usuário)."""
+    try:
+        linhas = INDICE_LOGS.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    vistos, logs = set(), []
+    for linha in linhas:
+        linha = linha.strip()
+        chave = os.path.normcase(linha)
+        if not linha or chave in vistos:
+            continue
+        vistos.add(chave)
+        if not so_existentes or Path(linha).is_file():
+            logs.append(Path(linha))
+    return logs
+
+
+def lembrar_log(caminho: Path) -> None:
+    """Anota o CSV no índice, para a consulta encontrá-lo depois, qualquer que seja a pasta."""
+    try:
+        texto = str(Path(caminho).resolve())
+        chave = os.path.normcase(texto)
+        with _TRAVA_INDICE:
+            if not _LEMBRADOS:
+                _LEMBRADOS.update(os.path.normcase(str(p)) for p in logs_conhecidos(False))
+            if chave in _LEMBRADOS:
+                return
+            PASTA_CONFIG.mkdir(parents=True, exist_ok=True)
+            with open(INDICE_LOGS, "a", encoding="utf-8") as f:
+                f.write(texto + "\n")
+            _LEMBRADOS.add(chave)
+    except OSError:
+        pass   # o índice é auxiliar; nunca interrompe a conversão
+
+
+def procurar_logs(pasta: Path) -> list[Path]:
+    """Procura CSVs de controle numa pasta e subpastas (registros anteriores ao índice) e os anota."""
+    achados = []
+    for raiz, dirs, arqs in os.walk(pasta, onerror=lambda e: None):
+        dirs[:] = [d for d in dirs if not d.startswith((".", "$")) and d.lower() not in ("appdata", "windows")]
+        if NOME_LOG in arqs:
+            achados.append(Path(raiz) / NOME_LOG)
+            lembrar_log(achados[-1])
+    return achados
+
+
+def _reg_num(texto) -> float | None:
+    try:
+        return float(str(texto).strip().replace(",", "."))
+    except ValueError:
+        return None
+
+
+def _reg_data(texto: str):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M"):
+        try:
+            return datetime.strptime(texto.strip(), fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def _reg_data_txt(r: dict) -> str:
+    return r["_data"].strftime("%d/%m/%Y %H:%M:%S") if r["_data"] else r.get(CHAVE_DATA, "")
+
+
+def _reg_k(valor) -> float:
+    return -1.0 if valor is None else valor
+
+
+def _reg_media(regs: list, chave: str) -> float | None:
+    notas = [n for n in (_reg_num(r.get(chave, "")) for r in regs) if n is not None]
+    return sum(notas) / len(notas) if notas else None
+
+
+def ler_log(caminho: Path) -> list[dict]:
+    """Linhas do CSV como dicionários (chaves = cabeçalho), mais a data lida e o caminho do log."""
+    try:
+        with open(caminho, newline="", encoding="utf-8-sig", errors="replace") as f:
+            linhas = list(csv.reader(f, delimiter=";"))
+    except OSError:
+        return []
+    if not linhas:
+        return []
+    cabecalho, regs = linhas[0], []
+    for linha in linhas[1:]:
+        if not any(c.strip() for c in linha):
+            continue
+        r = dict(zip(cabecalho, linha))
+        r["_data"] = _reg_data(r.get(CHAVE_DATA, ""))
+        r["_log"] = str(caminho)
+        regs.append(r)
+    return regs
+
+
+def filtrar_registros(regs: list, texto: str = "", situacao: str = "", de=None, ate=None) -> list:
+    texto, situacao = texto.strip().lower(), situacao.strip().lower()
+    saida = []
+    for r in regs:
+        if situacao and r.get("status", "").lower() != situacao:
+            continue
+        if texto and texto not in (r.get(CHAVE_ARQUIVO, "") + " " + r.get(CHAVE_MSG, "")).lower():
+            continue
+        if de and (r["_data"] is None or r["_data"].date() < de):
+            continue
+        if ate and (r["_data"] is None or r["_data"].date() > ate):
+            continue
+        saida.append(r)
+    return saida
+
+
+def abrir_externo(caminho: Path, selecionar: bool = False) -> None:
+    """Abre o arquivo no programa padrão, ou mostra-o selecionado no Explorador."""
+    try:
+        if os.name == "nt":
+            if selecionar:
+                subprocess.Popen(["explorer", "/select,", str(caminho)])
+            else:
+                os.startfile(str(caminho))
+        else:
+            subprocess.Popen(["xdg-open", str(caminho.parent if selecionar else caminho)])
+    except OSError:
+        pass
+
+
+def imprimir_registros(alvo: str = "", situacao: str = "") -> int:
+    """Modo terminal: mostra os registros no mesmo formato da tabela da janela."""
+    if alvo:
+        p = Path(alvo).expanduser()
+        logs = [p] if p.is_file() else (procurar_logs(p) if p.is_dir() else [])
+    else:
+        logs = logs_conhecidos()
+    regs = filtrar_registros([r for log in logs for r in ler_log(log)], situacao=situacao or "")
+    if not regs:
+        print("Nenhum registro encontrado.")
+        return 1
+    regs.sort(key=lambda r: r["_data"] or datetime.min)
+    linhas = [tuple(c[1] for c in COLUNAS_REG)] + [registro_para_tela(r)[0] for r in regs] + \
+             [total_registros(regs)]
+    linhas = [tuple(str(v)[:60] for v in lin) for lin in linhas]
+    larg = [max(len(lin[i]) for lin in linhas) for i in range(len(COLUNAS_REG))]
+    for k, lin in enumerate(linhas):
+        if k == len(linhas) - 1:
+            print("-" * (sum(larg) + 2 * len(larg)))
+        print("  ".join(v.ljust(w) if c[3] == "w" else v.rjust(w) for v, w, c in zip(lin, larg, COLUNAS_REG)))
+        if k == 0:
+            print("-" * (sum(larg) + 2 * len(larg)))
+    print(f"{len(regs)} registro(s), de {len(logs)} arquivo(s) de log.")
+    return 0
+
+
+def abrir_registros(janela, sugestoes=()) -> None:
+    """Janela de consulta: mesmas colunas da tela de conversão, mais a data e hora do processamento."""
+    import tkinter as tk
+    from tkinter import filedialog, ttk
+    from tkinter import font as tkfont
+
+    for pasta in sugestoes:
+        try:
+            if pasta and (Path(pasta) / NOME_LOG).is_file():
+                lembrar_log(Path(pasta) / NOME_LOG)
+        except OSError:
+            pass
+    fonte = tkfont.nametofont("TkDefaultFont")
+    negrito = (fonte.actual("family"), fonte.actual("size"), "bold")
+
+    dlg = tk.Toplevel(janela)
+    dlg.title(f"C&C - {TITULO} - Registros")
+    dlg.geometry("1220x640")
+    dlg.minsize(920, 440)
+    dlg.configure(bg=FUNDO)
+    dlg.transient(janela)
+    TODOS = "Todos os registros conhecidos"
+    v_fonte = tk.StringVar(value=TODOS)
+    v_texto = tk.StringVar()
+    v_sit = tk.StringVar(value="Todas")
+    v_de = tk.StringVar()
+    v_ate = tk.StringVar()
+    v_info = tk.StringVar()
+    dados = {"logs": [], "regs": [], "vis": [], "n_logs": 0, "ordem": (0, True)}
+
+    cima = ttk.Frame(dlg, padding=(14, 12, 14, 6))
+    cima.pack(fill="x")
+    cima.columnconfigure(1, weight=1)
+    ttk.Label(cima, text="Registro:", style="Rotulo.TLabel").grid(row=0, column=0, sticky="w")
+    c_fonte = ttk.Combobox(cima, textvariable=v_fonte, state="readonly")
+    c_fonte.grid(row=0, column=1, sticky="ew", padx=8)
+    ttk.Button(cima, text="Abrir arquivo...", command=lambda: abrir_arquivo()).grid(row=0, column=2)
+    ttk.Button(cima, text="Procurar em pasta...", command=lambda: procurar_pasta()).grid(
+        row=0, column=3, padx=(6, 0))
+    filtros = ttk.Frame(cima)
+    filtros.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+    ttk.Label(filtros, text="Filtrar:", style="Rotulo.TLabel").pack(side="left")
+    ttk.Label(filtros, text="Arquivo contém").pack(side="left", padx=(10, 0))
+    ttk.Entry(filtros, textvariable=v_texto, width=26).pack(side="left", padx=(4, 0))
+    ttk.Label(filtros, text="Situação").pack(side="left", padx=(14, 0))
+    c_sit = ttk.Combobox(filtros, textvariable=v_sit, state="readonly", width=12,
+                         values=("Todas",) + SITUACOES)
+    c_sit.pack(side="left", padx=(4, 0))
+    ttk.Label(filtros, text="Processado de").pack(side="left", padx=(14, 0))
+    e_de = ttk.Entry(filtros, textvariable=v_de, width=11)
+    e_de.pack(side="left", padx=(4, 0))
+    ttk.Label(filtros, text="até").pack(side="left", padx=(6, 0))
+    e_ate = ttk.Entry(filtros, textvariable=v_ate, width=11)
+    e_ate.pack(side="left", padx=(4, 0))
+    ttk.Label(filtros, text="dd/mm/aaaa", style="Dica.TLabel").pack(side="left", padx=(6, 0))
+    ttk.Button(filtros, text="Limpar", command=lambda: limpar()).pack(side="left", padx=(14, 0))
+
+    # Rodapé antes da tabela, para a tabela ocupar o espaço que sobrar.
+    base = ttk.Frame(dlg, padding=(14, 8, 14, 12))
+    base.pack(side="bottom", fill="x")
+    base.columnconfigure(0, weight=1)
+    ttk.Label(base, textvariable=v_info, wraplength=720, justify="left").grid(row=0, column=0, sticky="w")
+    ttk.Button(base, text="Atualizar", command=lambda: carregar()).grid(row=0, column=1, padx=(6, 0))
+    ttk.Button(base, text="Exportar...", command=lambda: exportar()).grid(row=0, column=2, padx=(6, 0))
+    ttk.Button(base, text="Abrir planilha", command=lambda: abrir_planilha()).grid(row=0, column=3, padx=(6, 0))
+    ttk.Button(base, text="Fechar", command=dlg.destroy).grid(row=0, column=4, padx=(6, 0))
+    ttk.Label(base, text="Clique no título de uma coluna para ordenar; duplo clique numa linha mostra o "
+                         "vídeo na pasta.", style="Dica.TLabel").grid(row=1, column=0, columnspan=5,
+                                                                      sticky="w", pady=(4, 0))
+
+    meio = ttk.Frame(dlg, padding=(14, 0))
+    meio.pack(fill="both", expand=True)
+    ids = [f"c{i}" for i in range(len(COLUNAS_REG))]
+    tabela = ttk.Treeview(meio, columns=ids, show="headings", selectmode="browse")
+    for i, (cid, (nome, titulo, larg, anc)) in enumerate(zip(ids, COLUNAS_REG)):
+        tabela.heading(cid, text=titulo, anchor=anc, command=lambda i=i: ordenar(i))
+        tabela.column(cid, width=larg, minwidth=40, anchor=anc, stretch=(nome == "arquivo"))
+    tabela.tag_configure("total", background=AZUL_CLARO, foreground=AZUL_ESCURO, font=negrito)
+    tabela.tag_configure("erro", foreground="#B42318")
+    rol_v = ttk.Scrollbar(meio, orient="vertical", command=tabela.yview)
+    rol_h = ttk.Scrollbar(meio, orient="horizontal", command=tabela.xview)
+    tabela.configure(yscrollcommand=rol_v.set, xscrollcommand=rol_h.set)
+    rol_h.pack(side="bottom", fill="x")
+    tabela.pack(side="left", fill="both", expand=True)
+    rol_v.pack(side="right", fill="y")
+
+    def data_do_campo(var):
+        texto = var.get().strip()
+        if not texto:
+            return None
+        for fmt in ("%d/%m/%Y", "%d/%m/%y", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(texto, fmt).date()
+            except ValueError:
+                pass
+        raise ValueError(texto)
+
+    def atualizar_fontes():
+        dados["logs"] = logs_conhecidos()
+        c_fonte["values"] = [TODOS] + [str(p) for p in dados["logs"]]
+        if v_fonte.get() not in c_fonte["values"]:
+            v_fonte.set(TODOS)
+
+    def carregar():
+        atualizar_fontes()
+        logs = dados["logs"] if v_fonte.get() == TODOS else [Path(v_fonte.get())]
+        dados["regs"] = [r for log in logs for r in ler_log(log)]
+        dados["n_logs"] = len(logs)
+        filtrar()
+
+    def filtrar(*_):
+        try:
+            de, ate = data_do_campo(v_de), data_do_campo(v_ate)
+        except ValueError as e:
+            v_info.set(f"Data inválida: {e}. Use dd/mm/aaaa.")
+            return
+        sit = "" if v_sit.get() == "Todas" else v_sit.get()
+        telas = [(r,) + registro_para_tela(r)
+                 for r in filtrar_registros(dados["regs"], v_texto.get(), sit, de, ate)]
+        col, desc = dados["ordem"]
+        telas.sort(key=lambda t: t[2][col], reverse=desc)
+        dados["vis"] = [t[0] for t in telas]
+        tabela.delete(*tabela.get_children())
+        for i, (r, valores, _) in enumerate(telas):
+            tabela.insert("", "end", iid=f"r{i}", values=valores,
+                          tags=("erro",) if r.get("status") == "Erro" else ())
+        if telas:
+            tabela.insert("", "end", iid="total", values=total_registros(dados["vis"]), tags=("total",))
+        for i, cid in enumerate(ids):
+            seta = (" ▼" if desc else " ▲") if i == col else ""
+            tabela.heading(cid, text=COLUNAS_REG[i][1] + seta)
+        if not dados["regs"]:
+            v_info.set("Nenhum registro encontrado. Os vídeos aparecem aqui depois de processados; para "
+                       "registros gravados antes desta versão, use \"Procurar em pasta...\".")
+        else:
+            v_info.set(f"{len(telas)} de {len(dados['regs'])} registro(s), "
+                       f"de {dados['n_logs']} arquivo(s) de log.")
+
+    def ordenar(i):
+        col, desc = dados["ordem"]
+        dados["ordem"] = (i, (not desc) if col == i else i == 0)
+        filtrar()
+
+    def limpar():
+        v_texto.set("")
+        v_sit.set("Todas")
+        v_de.set("")
+        v_ate.set("")
+        filtrar()
+
+    def abrir_arquivo():
+        p = filedialog.askopenfilename(parent=dlg, title="Abrir registro",
+                                       filetypes=[("Registro (CSV)", "*.csv"), ("Todos os arquivos", "*.*")])
+        if p:
+            lembrar_log(Path(p))
+            atualizar_fontes()
+            v_fonte.set(str(Path(p).resolve()))
+            carregar()
+
+    def procurar_pasta():
+        d = filedialog.askdirectory(parent=dlg, title="Procurar registros nesta pasta e nas subpastas")
+        if not d:
+            return
+        v_info.set("Procurando registros...")
+        dlg.configure(cursor="watch")
+        dlg.update_idletasks()
+        try:
+            achados = procurar_logs(Path(d))
+        finally:
+            dlg.configure(cursor="")
+        v_fonte.set(TODOS)
+        carregar()
+        v_info.set(f"{len(achados)} arquivo(s) de log encontrado(s) em {d}.  " + v_info.get())
+
+    def gravar_csv(destino: Path) -> None:
+        with open(destino, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f, delimiter=";")
+            w.writerow([c[1] for c in COLUNAS_REG] + ["Caminho do vídeo", "Arquivo de log"])
+            for r in dados["vis"]:
+                w.writerow(list(registro_para_tela(r)[0]) + [r.get(CHAVE_ARQUIVO, ""), r["_log"]])
+
+    def exportar():
+        if not dados["vis"]:
+            v_info.set("Nada para exportar com os filtros atuais.")
+            return
+        p = filedialog.asksaveasfilename(parent=dlg, title="Exportar registros", defaultextension=".csv",
+                                         initialfile="registros_filtrados.csv",
+                                         filetypes=[("Planilha CSV", "*.csv")])
+        if p:
+            try:
+                gravar_csv(Path(p))
+                v_info.set(f"{len(dados['vis'])} registro(s) exportado(s) para {p}.")
+            except OSError as e:
+                v_info.set(f"Não foi possível gravar {p}: {e.strerror or e}")
+
+    def abrir_planilha():
+        if v_fonte.get() != TODOS:
+            abrir_externo(Path(v_fonte.get()))
+            return
+        if not dados["vis"]:
+            v_info.set("Nada para abrir com os filtros atuais.")
+            return
+        try:
+            temp = Path(tempfile.gettempdir()) / f"registros_{ID_APP}_{datetime.now():%Y%m%d_%H%M%S}.csv"
+            gravar_csv(temp)
+            abrir_externo(temp)
+        except OSError as e:
+            v_info.set(f"Não foi possível abrir a planilha: {e.strerror or e}")
+
+    def mostrar_na_pasta(ev):
+        iid = tabela.identify_row(ev.y)
+        if not iid.startswith("r"):
+            return
+        r = dados["vis"][int(iid[1:])]
+        for chave in (CHAVE_ARQUIVO, CHAVE_SAIDA):
+            if chave and r.get(chave) and Path(r[chave]).exists():
+                abrir_externo(Path(r[chave]), selecionar=True)
+                return
+        abrir_externo(Path(r["_log"]), selecionar=True)
+
+    v_texto.trace_add("write", filtrar)
+    c_sit.bind("<<ComboboxSelected>>", lambda _: (c_sit.selection_clear(), filtrar()))
+    c_fonte.bind("<<ComboboxSelected>>", lambda _: (c_fonte.selection_clear(), carregar()))
+    for e in (e_de, e_ate):
+        e.bind("<Return>", filtrar)
+        e.bind("<FocusOut>", filtrar)
+    tabela.bind("<Double-1>", mostrar_na_pasta)
+    dlg.bind("<Escape>", lambda _: dlg.destroy())
+    carregar()
+    dlg.focus_set()
+
+
 # --------------------------------------------------------------------------
 # Janela
 # --------------------------------------------------------------------------
@@ -577,7 +1005,7 @@ def rodar_gui() -> int:
     from tkinter import font as tkfont
 
     janela = tk.Tk()
-    janela.title(f"C&C - {TITULO}")
+    janela.title(f"C&C - {TITULO} {VERSAO}")
     janela.geometry("1040x700")
     janela.minsize(860, 560)
     janela.configure(bg=FUNDO)
@@ -752,6 +1180,9 @@ def rodar_gui() -> int:
     b_iniciar.pack(fill="x")
     b_cancelar = ttk.Button(botoes, text="Cancelar", state="disabled")
     b_cancelar.pack(fill="x", pady=(6, 0))
+    ttk.Button(botoes, text="Registros...", command=lambda: abrir_registros(
+        janela, [v_pasta.get().strip(), v_saida.get().strip(), Path.home() / "Documents"])
+               ).pack(fill="x", pady=(6, 0))
 
     def atualizar_total():
         """Última linha da lista: totais das colunas e média do percentual de redução."""
@@ -1262,7 +1693,13 @@ def main() -> int:
                     help="apaga cada original depois de convertido com sucesso (sem confirmação, não vai para a Lixeira)")
     ap.add_argument("--crf", type=int, default=CRF_PADRAO, help=f"qualidade, menor = melhor (padrão {CRF_PADRAO})")
     ap.add_argument("--preset", type=int, default=PRESET_PADRAO, help=f"velocidade, menor = mais lento (padrão {PRESET_PADRAO})")
+    ap.add_argument("--versao", action="version", version=f"{TITULO} {VERSAO}")
+    ap.add_argument("--registros", nargs="?", const="", metavar="PASTA_OU_CSV",
+                    help="mostra os vídeos já processados (sem valor: todos os registros conhecidos)")
+    ap.add_argument("--situacao", default="", help="com --registros: só esta situação (ex.: Erro)")
     args = ap.parse_args()
+    if args.registros is not None:
+        return imprimir_registros(args.registros, args.situacao)
     return rodar_cli(args) if args.cli else rodar_gui()
 
 
